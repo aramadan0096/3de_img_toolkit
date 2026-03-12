@@ -58,6 +58,7 @@ except ImportError:
 try:
     import cv2  # type: ignore
     HAS_CV2 = True
+    os.environ["OPENCV_IO_ENABLE_OPENEXR"]="1"
 except ImportError:
     pass
 
@@ -549,52 +550,80 @@ def get_all_cameras() -> list[tuple[str, str]]:
 
 def get_camera_sequence_info(cam_id: str) -> dict:
     """
-    Return dict with keys: path, first_frame, last_frame.
-    Tries several API naming variants for robustness across minor releases.
-    """
-    info = {"path": "", "first_frame": 1, "last_frame": 1}
+    Return dict with keys: display_path, first_frame, last_frame, n_frames.
 
-    # --- sequence path ---
-    for fn_name in ("getCameraSequencePath", "getSequencePath",
-                    "getCameraImagePath"):
+    Uses the same strategy as cam_fetch.py:
+      - getCameraNoFrames()        → total frame count  (frames are 1-indexed)
+      - getCameraFrameFilepath()   → actual path for each frame
+      - getCameraPath()            → generic stored path for display only
+      - getCameraProxyFootage()    → proxy path fallback for display
+    """
+    info = {
+        "display_path": "",   # for UI label only; not used for actual I/O
+        "first_frame":  1,
+        "last_frame":   1,
+        "n_frames":     0,
+    }
+
+    # --- frame count (1-indexed, range is [1 .. n_frames]) ---
+    try:
+        n = tde4.getCameraNoFrames(cam_id)
+        if n:
+            info["n_frames"]   = int(n)
+            info["first_frame"] = 1
+            info["last_frame"]  = int(n)
+    except Exception:
+        pass
+
+    # --- display path for UI label (not used for loading) ---
+    # Priority: getCameraPath → getCameraProxyFootage → getCameraFrameFilepath(1)
+    for fn_name in ("getCameraPath", "getCameraProxyFootage"):
         fn = getattr(tde4, fn_name, None)
         if fn:
             try:
                 p = fn(cam_id)
+                if isinstance(p, (list, tuple)):
+                    p = p[0] if p else ""
                 if p:
-                    info["path"] = p
+                    info["display_path"] = str(p)
                     break
             except Exception:
                 pass
 
-    # --- first / last frame ---
-    for fn_name in ("getCameraSequenceFirstFrame", "getSequenceFirstFrame",
-                    "getFirstFrame"):
-        fn = getattr(tde4, fn_name, None)
-        if fn:
-            try:
-                info["first_frame"] = int(fn(cam_id))
-                break
-            except Exception:
-                pass
-
-    for fn_name in ("getCameraSequenceLastFrame", "getSequenceLastFrame",
-                    "getLastFrame"):
-        fn = getattr(tde4, fn_name, None)
-        if fn:
-            try:
-                info["last_frame"] = int(fn(cam_id))
-                break
-            except Exception:
-                pass
+    if not info["display_path"] and info["n_frames"] > 0:
+        try:
+            p = tde4.getCameraFrameFilepath(cam_id, 1)
+            if p:
+                info["display_path"] = p
+        except Exception:
+            pass
 
     return info
 
 
-def set_camera_sequence_path(cam_id: str, new_path: str):
-    """Set the footage path of *cam_id* in 3DE."""
+def get_camera_frame_filepath(cam_id: str, frame: int) -> str:
+    """
+    Return the actual on-disk file path for *frame* of *cam_id*.
+    Mirrors cam_fetch.py: tde4.getCameraFrameFilepath(cam, f).
+    Returns empty string if the path cannot be determined.
+    """
+    try:
+        fp = tde4.getCameraFrameFilepath(cam_id, frame)
+        return fp or ""
+    except Exception:
+        return ""
+
+
+def set_camera_sequence_path(cam_id: str, new_path: str,
+                             first_frame: int = 1, last_frame: int = 1):
+    """
+    Update the footage path of *cam_id* in 3DE.
+    Tries the standard sequence-setter API names first.
+    As a last resort, tries setCameraFrameFilepath per frame
+    (only practical for short ranges or single images).
+    """
     for fn_name in ("setCameraSequencePath", "setSequencePath",
-                    "setCameraImagePath"):
+                    "setCameraImagePath", "setCameraPath"):
         fn = getattr(tde4, fn_name, None)
         if fn:
             try:
@@ -602,7 +631,22 @@ def set_camera_sequence_path(cam_id: str, new_path: str):
                 return
             except Exception:
                 pass
-    raise RuntimeError("Could not find a setCameraSequencePath API function.")
+
+    # Last resort: set per-frame paths when the above all fail
+    set_fn = getattr(tde4, "setCameraFrameFilepath", None)
+    if set_fn:
+        for f in range(first_frame, last_frame + 1):
+            frame_path = expand_frame_path(new_path, f)
+            try:
+                set_fn(cam_id, f, frame_path)
+            except Exception:
+                pass
+        return
+
+    raise RuntimeError(
+        "Could not find any 3DE API function to set the camera footage path.\n"
+        f"Please update the footage path manually to:\n{new_path}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -800,14 +844,14 @@ class ImageViewer(QWidget):
 # ---------------------------------------------------------------------------
 
 class ExportThread(QThread):
-    progress     = Signal(int, str)     # (current_frame, message)
-    finished_ok  = Signal(str)          # output_seq_path
+    progress     = Signal(int, str)     # (frames_done, message)
+    finished_ok  = Signal(str, str)     # (output_dir, first_output_path)
     error        = Signal(str)
 
-    def __init__(self, seq_path: str, output_dir: str,
+    def __init__(self, cam_id: str, output_dir: str,
                  first: int, last: int, params: FilterParams):
         super().__init__()
-        self._seq_path   = seq_path
+        self._cam_id     = cam_id
         self._output_dir = output_dir
         self._first      = first
         self._last       = last
@@ -820,29 +864,50 @@ class ExportThread(QThread):
     def run(self):
         try:
             os.makedirs(self._output_dir, exist_ok=True)
-            output_seq = build_output_path(self._seq_path, self._output_dir)
+            total           = self._last - self._first + 1
+            first_out_path  = ""
+            frames_done     = 0
 
-            for i, frame in enumerate(range(self._first, self._last + 1)):
+            for frame in range(self._first, self._last + 1):
                 if self._abort:
                     self.error.emit("Export cancelled.")
                     return
 
-                in_path  = expand_frame_path(self._seq_path, frame)
-                out_path = expand_frame_path(output_seq, frame)
+                # ── resolve input path using the same API as cam_fetch.py ──
+                in_path = get_camera_frame_filepath(self._cam_id, frame)
+                if not in_path:
+                    # frame has no path registered – skip silently
+                    frames_done += 1
+                    self.progress.emit(frames_done,
+                                       f"Frame {frame} – no path, skipped")
+                    continue
 
-                msg = f"Frame {frame}  ({i + 1}/{self._last - self._first + 1})"
-                self.progress.emit(i, msg)
+                # ── mirror the filename into output_dir ──
+                out_path = os.path.join(
+                    self._output_dir, os.path.basename(in_path))
+
+                if not first_out_path:
+                    first_out_path = out_path
+
+                msg = (f"Frame {frame}  "
+                       f"({frames_done + 1}/{total})  "
+                       f"→  {os.path.basename(out_path)}")
+                self.progress.emit(frames_done, msg)
 
                 try:
                     pixels, meta = ImageIO.load(in_path)
                 except FileNotFoundError:
-                    # skip missing frames silently
+                    frames_done += 1
+                    self.progress.emit(frames_done,
+                                       f"Frame {frame} – file not found, skipped")
                     continue
 
                 filtered = ImageProcessor.process(pixels, self._params)
                 ImageIO.save(out_path, filtered, meta)
+                frames_done += 1
 
-            self.finished_ok.emit(output_seq)
+            self.finished_ok.emit(self._output_dir, first_out_path)
+
         except Exception as e:
             self.error.emit(f"{type(e).__name__}: {e}\n{traceback.format_exc()}")
 
@@ -926,7 +991,7 @@ class FilterToolkitWindow(QMainWindow):
         info_lbl = QLabel(
             f"<b>{self._cam_name}</b><br>"
             f"<span style='color:#888;font-size:10px;'>"
-            f"{self._seq_info['path'] or 'No sequence path'}</span>"
+            f"{self._seq_info['display_path'] or 'No footage path detected'}</span>"
         )
         info_lbl.setWordWrap(True)
         ctrl_layout.addWidget(info_lbl)
@@ -1026,7 +1091,7 @@ class FilterToolkitWindow(QMainWindow):
         out_dir_grp = QGroupBox("Output Directory")
         out_dir_lay = QVBoxLayout(out_dir_grp)
 
-        self._out_dir_edit = QLineEdit(suggest_output_dir(self._seq_info["path"]))
+        self._out_dir_edit = QLineEdit(suggest_output_dir(self._seq_info["display_path"]))
         self._out_dir_edit.setPlaceholderText("/path/to/output_folder")
         out_dir_lay.addWidget(self._out_dir_edit)
 
@@ -1134,9 +1199,13 @@ class FilterToolkitWindow(QMainWindow):
         self._params.brightness_value = self._contrast_grp.get_value("brightness")
 
     def _load_frame(self, frame: int):
-        path = expand_frame_path(self._seq_info["path"], frame)
+        # Use the same per-frame API as cam_fetch.py
+        path = get_camera_frame_filepath(self._cam_id, frame)
         if not path:
-            self._set_status("No sequence path configured for this camera.")
+            self._set_status(
+                f"Frame {frame}: no filepath returned by 3DE "
+                f"(getCameraFrameFilepath returned empty).")
+            self._current_frame_img = None
             return
 
         self._set_status(f"Loading  {os.path.basename(path)} …")
@@ -1145,7 +1214,7 @@ class FilterToolkitWindow(QMainWindow):
             self._current_frame_img = pixels
             self._set_status(
                 f"Frame {frame}   {pixels.shape[1]}×{pixels.shape[0]}"
-                f"  ch:{pixels.shape[2]}"
+                f"  ch:{pixels.shape[2]}   {os.path.basename(path)}"
             )
             self._schedule_preview(immediate=True)
         except Exception as e:
@@ -1185,9 +1254,10 @@ class FilterToolkitWindow(QMainWindow):
     # ---------------------------------------------------------------- Export -
 
     def _start_export(self):
-        if not self._seq_info["path"]:
-            QMessageBox.warning(self, "No Sequence",
-                                "This camera has no footage sequence path.")
+        if self._seq_info["n_frames"] == 0:
+            QMessageBox.warning(self, "No Footage",
+                                "This camera has no frames registered in 3DE.\n"
+                                "(getCameraNoFrames returned 0)")
             return
 
         out_dir = self._out_dir_edit.text().strip()
@@ -1220,7 +1290,7 @@ class FilterToolkitWindow(QMainWindow):
         self._progress_dlg.show()
 
         self._export_thread = ExportThread(
-            seq_path   = self._seq_info["path"],
+            cam_id     = self._cam_id,
             output_dir = out_dir,
             first      = self._seq_info["first_frame"],
             last       = self._seq_info["last_frame"],
@@ -1241,24 +1311,33 @@ class FilterToolkitWindow(QMainWindow):
             self._progress_dlg.setLabelText(msg)
         self._set_status(msg)
 
-    def _on_export_done(self, output_seq_path: str):
+    def _on_export_done(self, output_dir: str, first_out_path: str):
         self._export_btn.setEnabled(True)
         if hasattr(self, "_progress_dlg"):
             self._progress_dlg.close()
 
         # Update 3DE camera footage path
+        # We pass the first exported frame's path; set_camera_sequence_path
+        # tries the standard API names and falls back to per-frame setCameraFrameFilepath.
         try:
-            set_camera_sequence_path(self._cam_id, output_seq_path)
+            set_camera_sequence_path(
+                self._cam_id,
+                first_out_path,
+                self._seq_info["first_frame"],
+                self._seq_info["last_frame"],
+            )
             try:
                 tde4.updateGUI(0)
             except Exception:
                 pass
-            self._seq_info["path"] = output_seq_path
+            # Refresh display path in our local info cache
+            self._seq_info["display_path"] = first_out_path
             msg = (f"✔  Export complete.\n"
-                   f"3DE footage path updated to:\n{output_seq_path}")
+                   f"3DE footage path updated to:\n{output_dir}")
             self._set_status(msg.replace("\n", "  "))
             QMessageBox.information(self, "Export Complete",
-                                    msg.replace("✔  ", ""))
+                                    f"Frames written to:\n{output_dir}\n\n"
+                                    f"3DE footage path updated successfully.")
         except Exception as e:
             self._set_status(f"Export done but could not update 3DE: {e}")
             QMessageBox.warning(
@@ -1360,13 +1439,14 @@ class CameraPickerDialog(QDialog):
         if 0 <= idx < len(self._cameras):
             cam_id, cam_name = self._cameras[idx]
             info = get_camera_sequence_info(cam_id)
-            path = info["path"] or "(no sequence path)"
-            frames = info["last_frame"] - info["first_frame"] + 1
-            self._info_lbl.setText(
-                f"{path}\n"
+            path = info["display_path"] or "(no footage path detected)"
+            n    = info["n_frames"]
+            frames_str = (
                 f"Frames: {info['first_frame']} – {info['last_frame']}  "
-                f"({frames} frames)"
+                f"({n} frames)"
+                if n > 0 else "No frames registered (getCameraNoFrames = 0)"
             )
+            self._info_lbl.setText(f"{path}\n{frames_str}")
 
     def _on_select(self):
         idx = self._cam_combo.currentIndex()
