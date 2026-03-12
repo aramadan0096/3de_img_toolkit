@@ -1,89 +1,139 @@
-# print_3de_cameras.py
-# Run this from inside 3DEqualizer's Python console or as a 3DE4 script.
+# 3DE4.script.name: r_tools/footage fetch
+# 3DE4.script.version: 1.0
+# 3DE4.script.comment: Print all cameras and their footage file paths (per-frame if available)
+# 3DE4.script.startup: false
+# 3DE4.script.gui: true
+
 from __future__ import print_function
+import time
+import os
+import csv
+import tempfile
+
 try:
     import tde4
-except ImportError:
-    raise RuntimeError("This must be executed inside 3DEqualizer (tde4 module not found).")
+except Exception:
+    raise RuntimeError("This script must be run inside 3DEqualizer (tde4 module missing).")
 
 def get_all_cameras():
-    """
-    Try the direct list API first; if not available, fall back to first/next iteration.
-    Returns a list of camera IDs/handles.
-    """
     cams = []
+    # Prefer a direct list API if available
     try:
-        # Many versions provide getCameraList() which returns [cam,...]
-        cams = tde4.getCameraList()
+        cams = tde4.getCameraList() or []
     except Exception:
-        # Fallback: iterate first/next
-        cam = tde4.getFirstCamera()
-        while cam:
-            cams.append(cam)
-            cam = tde4.getNextCamera()
+        try:
+            cam = tde4.getFirstCamera()
+            while cam:
+                cams.append(cam)
+                cam = tde4.getNextCamera()
+        except Exception:
+            pass
     return cams
 
-def print_camera_paths():
+def get_camera_name(cam):
+    try:
+        return tde4.getCameraName(cam) or "<unnamed>"
+    except Exception:
+        return "<unnamed>"
+
+def gather_footage_records():
+    records = []  # tuples (camera_name, frame_or_range, filepath)
     cams = get_all_cameras()
     if not cams:
         print("No cameras found in the current project.")
-        return
+        return records
 
     for cam in cams:
-        try:
-            name = tde4.getCameraName(cam)
-        except Exception:
-            name = "<unnamed camera>"
-
-        print("Camera:", name)
-
-        # Try to print generic stored camera path (if any)
+        cam_name = get_camera_name(cam)
+        # Attempt a camera-level stored path attribute
         try:
             cam_path = tde4.getCameraPath(cam)
-            # getCameraPath may return a string or a list/tuple depending on version
-            if isinstance(cam_path, (list, tuple)):
-                for p in cam_path:
-                    print("  camera path:", p)
-            elif cam_path:
-                print("  camera path:", cam_path)
+            if cam_path:
+                # cam_path may be a string or list/tuple
+                if isinstance(cam_path, (list, tuple)):
+                    for p in cam_path:
+                        records.append((cam_name, "camera_path", p))
+                else:
+                    records.append((cam_name, "camera_path", cam_path))
         except Exception:
-            # ignore if function not present or fails
             pass
 
-        # Try proxy footage (some projects use proxy)
+        # Proxy footage (if any)
         try:
             proxy = tde4.getCameraProxyFootage(cam)
             if proxy:
-                print("  proxy footage:", proxy)
+                records.append((cam_name, "proxy", proxy))
         except Exception:
             pass
 
-        # Print per-frame filepaths when available
+        # Per-frame filepaths when supported
+        nframes = 0
         try:
-            nframes = tde4.getCameraNoFrames(cam) or 0
+            nframes = int(tde4.getCameraNoFrames(cam) or 0)
         except Exception:
             nframes = 0
 
         if nframes > 0:
-            # Many projects have a frame range; printing every frame can be verbose.
-            # We'll print only frames that return a path (non-empty).
+            # To avoid extremely long console output for very large ranges,
+            # we will record each frame but you can switch to sample printing if preferred.
             for f in range(1, nframes + 1):
                 try:
-                    filepath = tde4.getCameraFrameFilepath(cam, f)
+                    fp = tde4.getCameraFrameFilepath(cam, f)
                 except Exception:
-                    filepath = None
-                if filepath:
-                    print("   frame {:d}: {}".format(f, filepath))
+                    fp = None
+                if fp:
+                    records.append((cam_name, "frame_%d" % f, fp))
         else:
-            # Try a single-frame fallback (frame 1)
+            # Fallback: try frame 1
             try:
                 fp = tde4.getCameraFrameFilepath(cam, 1)
                 if fp:
-                    print("   frame 1:", fp)
+                    records.append((cam_name, "frame_1", fp))
             except Exception:
                 pass
 
-        print("")  # blank line between cameras
+    return records
 
+def write_csv(records, out_path):
+    try:
+        with open(out_path, "w", newline="") as fh:
+            writer = csv.writer(fh)
+            writer.writerow(["camera","frame_or_type","filepath"])
+            for r in records:
+                writer.writerow(r)
+        return True
+    except Exception as e:
+        print("Failed to write CSV:", e)
+        return False
+
+def run():
+    t0 = time.strftime("%Y%m%d_%H%M%S")
+    records = gather_footage_records()
+    if not records:
+        print("No footage paths found.")
+        return
+
+    # Print a compact summary to the 3DE console
+    print("\n=== Footage fetch results ===")
+    cameras_seen = {}
+    for cam, fr, path in records:
+        # show only one sample per camera in console to be readable, but still record all to CSV
+        if cam not in cameras_seen:
+            print("Camera: %s" % cam)
+            cameras_seen[cam] = 0
+        cameras_seen[cam] += 1
+        # show first few entries per camera (avoid giant dumps in console)
+        if cameras_seen[cam] <= 5:
+            print("   %s -> %s" % (fr, path))
+
+    # Save full CSV into the OS temp folder and print its location
+    tempdir = tempfile.gettempdir()
+    out_file = os.path.join(tempdir, "3de_footage_paths_%s.csv" % t0)
+    if write_csv(records, out_file):
+        print("\nFull list written to:", out_file)
+    else:
+        print("\nFailed to write full CSV. Records count:", len(records))
+
+# Entry point called by the 3DE menu/ScriptDB
 if __name__ == "__main__":
-    print_camera_paths()
+    run()

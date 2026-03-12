@@ -1,25 +1,19 @@
-# 3DE4.script.name:     R_Tools Image Filter Toolkit
-# 3DE4.script.version:  v1.0
-# 3DE4.script.gui:      r_tools/Start R img filter toolkit
-# 3DE4.script.comment:  High-end image filter toolkit for camera footage sequences.
-#                       Provides real-time preview and export of:
-#                       - Sharpness (Unsharp Mask)
-#                       - High-Pass Detail Enhancement
-#                       - Contrast / Brightness
-#                       Supports OpenEXR sequences (VFX industry standard).
-#                       Requires: PySide6, numpy, scipy.
-#                       Optional but recommended: OpenImageIO (oiio).
+# 3DE4.script.name:	Image toolkit
 #
-# Install location: ~/.3dequalizer/py_scripts/  or  $TDE4_SCRIPT_PATH
+# 3DE4.script.gui:	Main Window::R Tools
+#
+# 3DE4.script.comment:	Run R_tools image toolkit GUI.
 
+from __future__ import annotations
 import sys
 import os
 import re
 import copy
-import time
 import traceback
-import numpy as np
+import concurrent.futures
 from pathlib import Path
+
+import numpy as np
 
 import tde4  # 3DEqualizer Python API
 
@@ -28,555 +22,446 @@ import tde4  # 3DEqualizer Python API
 # ---------------------------------------------------------------------------
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QDialog,
-    QVBoxLayout, QHBoxLayout, QGridLayout,
+    QVBoxLayout, QHBoxLayout,
     QLabel, QSlider, QPushButton, QComboBox, QCheckBox,
     QGroupBox, QScrollArea, QSizePolicy, QProgressDialog,
-    QMessageBox, QFrame, QSpinBox, QDoubleSpinBox,
-    QFileDialog, QStatusBar, QToolButton, QSplitter,
-    QLineEdit
+    QMessageBox, QFrame, QDoubleSpinBox,
+    QFileDialog, QStatusBar, QLineEdit,
 )
-from PySide6.QtCore import (
-    Qt, QThread, Signal, QTimer, QSize, QRect, QPoint, QMutex
-)
-from PySide6.QtGui import (
-    QPixmap, QImage, QPainter, QColor, QFont, QIcon,
-    QPalette, QCursor
-)
+from PySide6.QtCore import Qt, QThread, Signal, QTimer, QPointF
+from PySide6.QtGui  import QPixmap, QImage, QPainter, QColor, QWheelEvent
 
 # ---------------------------------------------------------------------------
-# Optional image I/O backends
+# Mandatory: OpenImageIO  (fix #7 - CV2 EXR codec disabled in stock wheels)
 # ---------------------------------------------------------------------------
-HAS_OIIO = False
-HAS_CV2   = False
-
 try:
     import OpenImageIO as oiio   # type: ignore
     HAS_OIIO = True
 except ImportError:
-    pass
+    HAS_OIIO = False
 
-try:
-    import cv2  # type: ignore
-    HAS_CV2 = True
-    os.environ["OPENCV_IO_ENABLE_OPENEXR"]="1"
-except ImportError:
-    pass
-
+# ---------------------------------------------------------------------------
+# Optional backends
+# ---------------------------------------------------------------------------
 try:
     from scipy.ndimage import gaussian_filter as _scipy_gaussian  # type: ignore
     HAS_SCIPY = True
 except ImportError:
     HAS_SCIPY = False
 
+try:
+    import cv2  # type: ignore  -- used ONLY for denoising (uint8), never for EXR
+    HAS_CV2 = True
+except ImportError:
+    HAS_CV2 = False
+
+try:
+    import cupy as cp   # type: ignore  -- GPU acceleration
+    HAS_CUPY = True
+except ImportError:
+    HAS_CUPY = False
+
 # ---------------------------------------------------------------------------
-# Dark VFX-style stylesheet
+# Dark VFX stylesheet
 # ---------------------------------------------------------------------------
 DARK_STYLE = """
 QWidget {
-    background-color: #252526;
-    color: #cccccc;
-    font-family: "Segoe UI", "SF Pro Text", Arial, sans-serif;
-    font-size: 11px;
+    background-color:#252526; color:#cccccc;
+    font-family:"Segoe UI","SF Pro Text",Arial,sans-serif; font-size:11px;
 }
-QMainWindow, QDialog {
-    background-color: #1e1e1e;
-}
+QMainWindow,QDialog { background-color:#1e1e1e; }
 QGroupBox {
-    border: 1px solid #3a3a3a;
-    border-radius: 5px;
-    margin-top: 10px;
-    padding: 6px 4px 4px 4px;
-    font-weight: bold;
-    color: #8ab4e8;
-    font-size: 11px;
+    border:1px solid #3a3a3a; border-radius:5px;
+    margin-top:10px; padding:6px 4px 4px 4px;
+    font-weight:bold; color:#8ab4e8; font-size:11px;
 }
-QGroupBox::title {
-    subcontrol-origin: margin;
-    subcontrol-position: top left;
-    left: 8px;
-    padding: 0 4px;
-}
-QSlider::groove:horizontal {
-    height: 4px;
-    background: #3c3c3c;
-    border-radius: 2px;
-}
+QGroupBox::title { subcontrol-origin:margin; subcontrol-position:top left;
+    left:8px; padding:0 4px; }
+QSlider::groove:horizontal { height:4px; background:#3c3c3c; border-radius:2px; }
 QSlider::handle:horizontal {
-    background: #4a90d9;
-    border: 1px solid #3a78bd;
-    width: 14px;
-    height: 14px;
-    margin: -5px 0;
-    border-radius: 7px;
+    background:#4a90d9; border:1px solid #3a78bd;
+    width:14px; height:14px; margin:-5px 0; border-radius:7px;
 }
-QSlider::handle:horizontal:hover {
-    background: #5aa0e8;
-}
-QSlider::sub-page:horizontal {
-    background: #2a5f9e;
-    border-radius: 2px;
-}
-QSlider::groove:horizontal:disabled {
-    background: #2a2a2a;
-}
-QSlider::handle:horizontal:disabled {
-    background: #404040;
-    border-color: #383838;
-}
+QSlider::handle:horizontal:hover  { background:#5aa0e8; }
+QSlider::sub-page:horizontal      { background:#2a5f9e; border-radius:2px; }
+QSlider::groove:horizontal:disabled  { background:#2a2a2a; }
+QSlider::handle:horizontal:disabled  { background:#404040; border-color:#383838; }
 QPushButton {
-    background-color: #3c3c3c;
-    border: 1px solid #505050;
-    border-radius: 4px;
-    padding: 5px 14px;
-    color: #cccccc;
-    min-height: 22px;
+    background-color:#3c3c3c; border:1px solid #505050;
+    border-radius:4px; padding:5px 14px; color:#cccccc; min-height:22px;
 }
-QPushButton:hover   { background-color: #4a4a4a; border-color: #606060; }
-QPushButton:pressed { background-color: #2a2a2a; }
-QPushButton:disabled{ background-color: #2e2e2e; color: #666; border-color: #383838; }
+QPushButton:hover   { background-color:#4a4a4a; border-color:#606060; }
+QPushButton:pressed { background-color:#2a2a2a; }
+QPushButton:disabled{ background-color:#2e2e2e; color:#666; border-color:#383838; }
 QPushButton#export_btn {
-    background-color: #1e5c1e;
-    border: 1px solid #2a7a2a;
-    color: #88ff88;
-    font-weight: bold;
-    font-size: 12px;
-    min-height: 30px;
-    padding: 6px 20px;
+    background-color:#1e5c1e; border:1px solid #2a7a2a;
+    color:#88ff88; font-weight:bold; font-size:12px;
+    min-height:30px; padding:6px 20px;
 }
-QPushButton#export_btn:hover   { background-color: #256025; }
-QPushButton#export_btn:pressed { background-color: #143314; }
-QPushButton#export_btn:disabled{ background-color: #1a2e1a; color: #446644; }
-QPushButton#reset_btn {
-    background-color: #3a2828;
-    border-color: #583838;
-    color: #ffaaaa;
+QPushButton#export_btn:hover   { background-color:#256025; }
+QPushButton#export_btn:pressed { background-color:#143314; }
+QPushButton#export_btn:disabled{ background-color:#1a2e1a; color:#446644; }
+QPushButton#reset_btn { background-color:#3a2828; border-color:#583838; color:#ffaaaa; }
+QPushButton#reset_btn:hover { background-color:#4a3030; }
+QPushButton#zoom_btn {
+    background-color:#2a2a3a; border:1px solid #404060;
+    color:#aaaaee; padding:2px 8px; min-height:18px; font-size:13px;
 }
-QPushButton#reset_btn:hover { background-color: #4a3030; }
+QPushButton#zoom_btn:hover { background-color:#333350; }
 QComboBox {
-    background-color: #333333;
-    border: 1px solid #505050;
-    border-radius: 4px;
-    padding: 4px 8px;
-    min-height: 22px;
+    background-color:#333333; border:1px solid #505050;
+    border-radius:4px; padding:4px 8px; min-height:22px;
 }
-QComboBox::drop-down { border: none; width: 20px; }
+QComboBox::drop-down { border:none; width:20px; }
 QComboBox QAbstractItemView {
-    background-color: #2d2d2d;
-    selection-background-color: #3a6ea8;
-    border: 1px solid #505050;
+    background-color:#2d2d2d; selection-background-color:#3a6ea8;
+    border:1px solid #505050;
 }
-QDoubleSpinBox, QSpinBox {
-    background-color: #2d2d2d;
-    border: 1px solid #484848;
-    border-radius: 3px;
-    padding: 2px 4px;
-    min-width: 54px;
-    max-width: 64px;
-    min-height: 20px;
+QDoubleSpinBox {
+    background-color:#2d2d2d; border:1px solid #484848;
+    border-radius:3px; padding:2px 4px;
+    min-width:54px; max-width:64px; min-height:20px;
 }
-QDoubleSpinBox:disabled, QSpinBox:disabled { color: #555; background-color: #252525; }
+QDoubleSpinBox:disabled { color:#555; background-color:#252525; }
 QCheckBox::indicator {
-    width: 14px; height: 14px;
-    border: 1px solid #555;
-    border-radius: 3px;
-    background-color: #2d2d2d;
+    width:14px; height:14px; border:1px solid #555;
+    border-radius:3px; background-color:#2d2d2d;
 }
-QCheckBox::indicator:checked {
-    background-color: #2a5f9e;
-    border-color: #4a90d9;
-    image: none;
-}
-QLabel#frame_label {
-    font-size: 18px;
-    font-weight: bold;
-    color: #5bb0ff;
-    qproperty-alignment: AlignCenter;
-}
-QLabel#status_label {
-    color: #aaaaaa;
-    font-size: 10px;
-    padding: 2px 6px;
-}
-QLabel#section_title {
-    font-size: 10px;
-    color: #888888;
-    font-weight: bold;
-    letter-spacing: 1px;
-    padding: 4px 0 2px 0;
-}
-QScrollArea { border: none; }
-QScrollBar:vertical {
-    background: #1e1e1e;
-    width: 8px;
-    border-radius: 4px;
-}
-QScrollBar::handle:vertical {
-    background: #484848;
-    border-radius: 4px;
-    min-height: 20px;
-}
-QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
-QFrame#separator {
-    background-color: #3a3a3a;
-    max-height: 1px;
-}
+QCheckBox::indicator:checked { background-color:#2a5f9e; border-color:#4a90d9; }
+QLabel#frame_label  { font-size:18px; font-weight:bold; color:#5bb0ff;
+    qproperty-alignment:AlignCenter; }
+QLabel#status_label { color:#aaaaaa; font-size:10px; padding:2px 6px; }
+QLabel#section_title{ font-size:10px; color:#888888; font-weight:bold;
+    letter-spacing:1px; padding:4px 0 2px 0; }
+QScrollArea { border:none; }
+QScrollBar:vertical { background:#1e1e1e; width:8px; border-radius:4px; }
+QScrollBar::handle:vertical { background:#484848; border-radius:4px; min-height:20px; }
+QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical { height:0; }
+QFrame#separator { background-color:#3a3a3a; max-height:1px; }
 QLineEdit {
-    background-color: #2d2d2d;
-    border: 1px solid #484848;
-    border-radius: 3px;
-    padding: 3px 6px;
-    color: #cccccc;
-}
-QProgressDialog {
-    background-color: #252526;
-    color: #cccccc;
+    background-color:#2d2d2d; border:1px solid #484848;
+    border-radius:3px; padding:3px 6px; color:#cccccc;
 }
 """
 
 # ---------------------------------------------------------------------------
-# Sequence / Frame Utilities
+# Sequence / path helpers
 # ---------------------------------------------------------------------------
 
 def expand_frame_path(seq_path: str, frame: int) -> str:
-    """Expand a sequence path template to a concrete file path for *frame*."""
     if not seq_path:
         return ""
-    # printf-style: %04d, %d, %05d …
     if re.search(r'%\d*d', seq_path):
         try:
             return seq_path % frame
         except Exception:
             pass
-    # hash-style: ####, #####
     m = re.search(r'(#+)', seq_path)
     if m:
         hashes = m.group(1)
-        padded = str(frame).zfill(len(hashes))
-        return seq_path[:m.start()] + padded + seq_path[m.end():]
-    # No pattern – single image
+        return seq_path[:m.start()] + str(frame).zfill(len(hashes)) + seq_path[m.end():]
     return seq_path
 
 
-def suggest_output_dir(seq_path: str) -> str:
-    """Suggest an output directory based on the input sequence path."""
-    if not seq_path:
+def make_sequence_pattern(filepath: str) -> str:
+    """
+    /shots/seq.0042.exr  ->  /shots/seq.####.exr
+    Replaces the last contiguous digit run in the filename with # chars.
+    fix #5: 3DE Pattern field needs #### not an absolute frame path.
+    """
+    parent  = os.path.dirname(filepath)
+    name    = os.path.basename(filepath)
+    matches = list(re.finditer(r'\d+', name))
+    if not matches:
+        return filepath
+    m       = matches[-1]
+    pattern = name[:m.start()] + '#' * len(m.group()) + name[m.end():]
+    return os.path.join(parent, pattern)
+
+
+def suggest_output_dir(display_path: str) -> str:
+    if not display_path:
         return ""
-    parent = str(Path(seq_path).parent)
-    return parent + "_filtered"
-
-
-def build_output_path(input_seq_path: str, output_dir: str) -> str:
-    """Build an output sequence path preserving the filename pattern."""
-    filename = Path(input_seq_path).name
-    return os.path.join(output_dir, filename)
+    return str(Path(display_path).parent) + "_filtered"
 
 
 # ---------------------------------------------------------------------------
-# Image I/O
+# Image I/O  --  OIIO only for EXR  (fix #7)
 # ---------------------------------------------------------------------------
 
 class ImageIO:
-    """Abstraction layer over OIIO / OpenCV / basic fallback for EXR I/O."""
 
     @staticmethod
     def load(path: str) -> tuple[np.ndarray, dict]:
-        """
-        Load an image as float32 numpy array (H, W, C) in RGB(A) order.
-        Returns (pixels, metadata_dict).
-        """
         if not os.path.isfile(path):
             raise FileNotFoundError(f"Image not found: {path}")
-
-        if HAS_OIIO:
-            return ImageIO._load_oiio(path)
-        elif HAS_CV2:
-            return ImageIO._load_cv2(path)
-        else:
+        if not HAS_OIIO:
             raise RuntimeError(
-                "No image backend available.\n"
-                "Please install OpenImageIO or OpenCV (cv2)."
+                "OpenImageIO Python binding is required.\n"
+                "Install:  pip install openimageio\n"
+                "(The system OIIO binary is NOT sufficient.)"
             )
-
-    @staticmethod
-    def save(path: str, pixels: np.ndarray, metadata: dict | None = None):
-        """Save float32 (H, W, C) array to *path* (EXR or other format)."""
-        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-
-        if HAS_OIIO:
-            ImageIO._save_oiio(path, pixels, metadata)
-        elif HAS_CV2:
-            ImageIO._save_cv2(path, pixels)
-        else:
-            raise RuntimeError("No image backend available for saving.")
-
-    # -- OIIO --
-    @staticmethod
-    def _load_oiio(path: str):
         inp = oiio.ImageInput.open(path)
         if inp is None:
-            raise IOError(f"OIIO: cannot open {path}")
-        spec  = inp.spec()
-        nch   = spec.nchannels
+            raise IOError(f"OIIO cannot open '{path}': {oiio.geterror()}")
+        spec   = inp.spec()
         pixels = inp.read_image(oiio.FLOAT)
         inp.close()
         if pixels is None:
-            raise IOError(f"OIIO: read_image failed for {path}")
-        # Ensure (H, W, C)
+            raise IOError(f"OIIO read_image failed for '{path}'")
         if pixels.ndim == 2:
             pixels = pixels[:, :, np.newaxis]
-        pixels = pixels.astype(np.float32)
         meta = {
-            "width": spec.width,
-            "height": spec.height,
-            "nchannels": nch,
+            "width":        spec.width,
+            "height":       spec.height,
+            "nchannels":    spec.nchannels,
             "channelnames": list(spec.channelnames),
         }
-        return pixels, meta
+        return pixels.astype(np.float32), meta
 
     @staticmethod
-    def _save_oiio(path: str, pixels: np.ndarray, metadata: dict | None):
+    def save(path: str, pixels: np.ndarray, metadata: dict | None = None):
+        if not HAS_OIIO:
+            raise RuntimeError("OpenImageIO is required for saving.")
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
         h, w = pixels.shape[:2]
-        nc = pixels.shape[2] if pixels.ndim == 3 else 1
+        nc   = pixels.shape[2] if pixels.ndim == 3 else 1
         spec = oiio.ImageSpec(w, h, nc, oiio.FLOAT)
         spec.attribute("compression", "zips")
         if metadata and "channelnames" in metadata:
             spec.channelnames = metadata["channelnames"]
         out = oiio.ImageOutput.create(path)
         if out is None:
-            raise IOError(f"OIIO: cannot create {path}")
+            raise IOError(f"OIIO cannot create '{path}': {oiio.geterror()}")
         out.open(path, spec)
         out.write_image(pixels)
         out.close()
 
-    # -- OpenCV --
-    @staticmethod
-    def _load_cv2(path: str):
-        flags = cv2.IMREAD_UNCHANGED | cv2.IMREAD_ANYDEPTH | cv2.IMREAD_ANYCOLOR
-        img = cv2.imread(path, flags)
-        if img is None:
-            raise IOError(f"cv2: cannot open {path}")
-        if img.ndim == 2:
-            img = img[:, :, np.newaxis]
-        elif img.shape[2] == 3:
-            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        elif img.shape[2] == 4:
-            img = cv2.cvtColor(img, cv2.COLOR_BGRA2RGBA)
-        img = img.astype(np.float32)
-        if img.max() > 2.0:          # 8-bit or 16-bit range
-            img /= 65535.0 if img.max() > 255.0 else 255.0
-        meta = {"width": img.shape[1], "height": img.shape[0],
-                "nchannels": img.shape[2]}
-        return img, meta
 
-    @staticmethod
-    def _save_cv2(path: str, pixels: np.ndarray):
-        ext = Path(path).suffix.lower()
-        if ext == ".exr":
-            img = pixels.copy()
-        else:
-            img = np.clip(pixels, 0, 1)
-        if img.shape[2] == 3:
-            img_out = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-        elif img.shape[2] == 4:
-            img_out = cv2.cvtColor(img, cv2.COLOR_RGBA2BGRA)
-        else:
-            img_out = img
-        cv2.imwrite(path, img_out.astype(np.float32))
+# ---------------------------------------------------------------------------
+# Performance helpers  (fix #1)
+# ---------------------------------------------------------------------------
+
+PREVIEW_MAX_PX = 1440   # longest-edge cap for interactive preview
+
+def downscale_for_preview(img: np.ndarray) -> np.ndarray:
+    h, w = img.shape[:2]
+    if max(h, w) <= PREVIEW_MAX_PX:
+        return img
+    scale = PREVIEW_MAX_PX / max(h, w)
+    nh, nw = max(1, int(h * scale)), max(1, int(w * scale))
+    if HAS_CV2:
+        return cv2.resize(img, (nw, nh), interpolation=cv2.INTER_LINEAR)
+    # numpy nearest-neighbour fallback
+    row_idx = np.linspace(0, h - 1, nh, dtype=int)
+    col_idx = np.linspace(0, w - 1, nw, dtype=int)
+    return img[np.ix_(row_idx, col_idx)]
 
 
 # ---------------------------------------------------------------------------
-# Image Processing
+# Gaussian blur  (scipy > cv2 > pure-numpy)
 # ---------------------------------------------------------------------------
 
 def _gaussian(img: np.ndarray, sigma: float) -> np.ndarray:
-    """Gaussian blur with available backend."""
     if HAS_SCIPY:
         return _scipy_gaussian(img, sigma=sigma, mode='reflect')
-    elif HAS_CV2:
-        k = int(sigma * 6) | 1          # ensure odd
-        k = max(k, 3)
+    if HAS_CV2:
+        k = max(3, int(sigma * 6) | 1)
         return cv2.GaussianBlur(img, (k, k), sigmaX=sigma, sigmaY=sigma)
-    else:
-        # Pure-numpy separable approximation (slow, last resort)
-        from numpy import pad
-        radius = max(1, int(sigma * 3))
-        x = np.arange(-radius, radius + 1)
-        kern = np.exp(-x**2 / (2 * sigma**2))
-        kern /= kern.sum()
-        result = np.copy(img)
-        for ax in (0, 1):
-            result = np.apply_along_axis(
-                lambda v: np.convolve(v, kern, mode='same'), ax, result
-            )
-        return result
+    radius = max(1, int(sigma * 3))
+    x      = np.arange(-radius, radius + 1, dtype=np.float32)
+    kern   = np.exp(-x**2 / (2.0 * sigma**2))
+    kern  /= kern.sum()
+    result = np.copy(img)
+    for ax in (0, 1):
+        result = np.apply_along_axis(
+            lambda v: np.convolve(v, kern, mode='same'), ax, result)
+    return result
 
+
+# ---------------------------------------------------------------------------
+# Filter parameters
+# ---------------------------------------------------------------------------
 
 class FilterParams:
-    """Holds all filter parameter values."""
     def __init__(self):
-        self.sharpen_enabled   = False
-        self.sharpen_amount    = 1.0     # 0 – 3
-        self.sharpen_radius    = 1.0     # 0.3 – 5.0
+        # 1. Denoise (runs first)
+        self.denoise_enabled         = False
+        self.denoise_h               = 10.0
+        self.denoise_hcolor          = 10.0
+        self.denoise_template_window = 7
+        self.denoise_search_window   = 21
 
-        self.highpass_enabled  = False
-        self.highpass_amount   = 0.5     # 0 – 2
-        self.highpass_radius   = 5.0     # 1 – 20
+        # 2. Sharpness
+        self.sharpen_enabled  = False
+        self.sharpen_amount   = 1.0
+        self.sharpen_radius   = 1.0
 
+        # 3. High-Pass
+        self.highpass_enabled = False
+        self.highpass_amount  = 0.5
+        self.highpass_radius  = 5.0
+
+        # 4. Contrast / Brightness
         self.contrast_enabled  = False
-        self.contrast_value    = 1.0     # 0.25 – 3 (1 = neutral)
-        self.brightness_value  = 0.0     # −1 – +1 (0 = neutral)
+        self.contrast_value    = 1.0
+        self.brightness_value  = 0.0
 
-    def copy(self):
+    def copy(self) -> FilterParams:
         return copy.copy(self)
 
 
+# ---------------------------------------------------------------------------
+# Image processing pipeline
+# ---------------------------------------------------------------------------
+
 class ImageProcessor:
-    """Applies filter stack to a float32 numpy image array."""
+    """Order: Denoise -> Sharpen -> High-Pass -> Contrast"""
 
     @staticmethod
     def process(img: np.ndarray, params: FilterParams) -> np.ndarray:
         result = img.astype(np.float32)
 
+        if params.denoise_enabled:
+            result = ImageProcessor._denoise(
+                result,
+                params.denoise_h,
+                params.denoise_hcolor,
+                int(params.denoise_template_window),
+                int(params.denoise_search_window),
+            )
         if params.sharpen_enabled and params.sharpen_amount > 0:
             result = ImageProcessor._unsharp_mask(
                 result, params.sharpen_amount, params.sharpen_radius)
-
         if params.highpass_enabled and params.highpass_amount > 0:
             result = ImageProcessor._highpass(
                 result, params.highpass_amount, params.highpass_radius)
-
         if params.contrast_enabled:
             result = ImageProcessor._contrast(
                 result, params.contrast_value, params.brightness_value)
 
         return result
 
+    # ── Denoise (fix #2) ──────────────────────────────────────────────────
+    @staticmethod
+    def _denoise(img: np.ndarray, h: float, hcolor: float,
+                 tmpl_win: int, search_win: int) -> np.ndarray:
+        """
+        cv2.fastNlMeansDenoisingColored wrapped for float32 scene-linear EXR.
+        Docs: https://docs.opencv.org/3.4/d1/d79/group__photo__denoise.html
+        NLM operates on uint8 BGR. We normalise to [0,255], denoise, then
+        invert-normalise to restore the original scene-linear scale.
+        """
+        if not HAS_CV2:
+            return img
+
+        # Ensure odd window sizes as required by NLM
+        tmpl_win   = tmpl_win   if tmpl_win   % 2 == 1 else tmpl_win   + 1
+        search_win = search_win if search_win % 2 == 1 else search_win + 1
+
+        rgb_f   = np.clip(img[:, :, :3], 0, None).astype(np.float32)
+        # Per-channel max to preserve HDR range after round-trip
+        ch_max  = rgb_f.max(axis=(0, 1), keepdims=True).clip(1e-6)
+        rgb_u8  = ((rgb_f / ch_max) * 255).astype(np.uint8)
+
+        bgr_u8  = cv2.cvtColor(rgb_u8,  cv2.COLOR_RGB2BGR)
+        bgr_den = cv2.fastNlMeansDenoisingColored(
+            bgr_u8, None,
+            h=float(h), hColor=float(hcolor),
+            templateWindowSize=tmpl_win,
+            searchWindowSize=search_win,
+        )
+        rgb_den = cv2.cvtColor(bgr_den, cv2.COLOR_BGR2RGB)
+
+        # Restore scene-linear scale
+        rgb_out = (rgb_den.astype(np.float32) / 255.0) * ch_max
+
+        result           = img.copy()
+        result[:, :, :3] = rgb_out
+        return result
+
+    # ── Sharpness ────────────────────────────────────────────────────────────
     @staticmethod
     def _unsharp_mask(img, amount, radius):
-        """Classic unsharp mask: sharpen = original + amount*(original - blur)."""
         blurred = _gaussian(img, sigma=radius)
         return img + amount * (img - blurred)
 
+    # ── High-Pass ─────────────────────────────────────────────────────────────
     @staticmethod
     def _highpass(img, amount, radius):
-        """
-        High-pass detail layer (soft-light blend).
-        Separates broad low-frequency base from fine-detail layer,
-        then re-applies the detail at *amount* strength.
-        Mathematically: img + amount*(img - blur)
-        with a larger radius than sharpening for mid-frequency content.
-        """
         blurred = _gaussian(img, sigma=radius)
-        hp = img - blurred  # zero-centred detail
-        return img + amount * hp
+        return img + amount * (img - blurred)
 
+    # ── Contrast / Brightness ─────────────────────────────────────────────────
     @staticmethod
     def _contrast(img, contrast, brightness):
-        """
-        Contrast around photographic gray pivot (0.18).
-        contrast: 1.0 = neutral, >1 = more, <1 = less
-        brightness: 0.0 = neutral, +/- in scene-linear units
-        """
         PIVOT = 0.18
         return PIVOT + contrast * (img - PIVOT) + brightness
 
 
 # ---------------------------------------------------------------------------
-# Tone-mapping for display
+# Tone-mapping (preview only)
 # ---------------------------------------------------------------------------
 
 def tonemap_display(img: np.ndarray, exposure: float = 0.0) -> np.ndarray:
-    """
-    Convert scene-linear float32 (H,W,C) → sRGB uint8 for Qt display.
-    *exposure* is in EV stops (0 = neutral).
-    Uses Reinhard tone-map then sRGB gamma.
-    """
     gain = 2.0 ** exposure
-    rgb = img[:, :, :3].astype(np.float32) * gain
-    # Reinhard global operator
-    rgb = rgb / (1.0 + rgb)
+    rgb  = img[:, :, :3].astype(np.float32) * gain
+    rgb  = rgb / (1.0 + rgb)
     np.clip(rgb, 0, 1, out=rgb)
-    # sRGB approximate gamma
-    rgb = np.where(rgb <= 0.0031308,
-                   12.92 * rgb,
-                   1.055 * np.power(rgb, 1.0 / 2.4) - 0.055)
+    rgb  = np.where(rgb <= 0.0031308,
+                    12.92 * rgb,
+                    1.055 * np.power(rgb, 1.0 / 2.4) - 0.055)
     np.clip(rgb, 0, 1, out=rgb)
     return (rgb * 255).astype(np.uint8)
 
 
 def numpy_to_qpixmap(arr: np.ndarray) -> QPixmap:
-    """Convert uint8 (H,W,3) RGB numpy array to QPixmap."""
-    arr = np.ascontiguousarray(arr)
+    arr  = np.ascontiguousarray(arr)
     h, w, _ = arr.shape
     qimg = QImage(arr.data, w, h, w * 3, QImage.Format.Format_RGB888)
-    return QPixmap.fromImage(qimg)
+    return QPixmap.fromImage(qimg.copy())   # .copy() detaches from numpy buffer
 
 
 # ---------------------------------------------------------------------------
-# 3DE Camera Utilities
+# 3DE camera API helpers
 # ---------------------------------------------------------------------------
 
 def get_all_cameras() -> list[tuple[str, str]]:
-    """Return [(cam_id, display_name), ...] across all point-groups."""
-    cameras = []
+    cameras: list[tuple[str, str]] = []
     try:
-        pgs = tde4.getPGroupList()
-    except Exception:
-        pgs = []
-
-    # Also try without pgroup argument
-    try:
-        all_cams = tde4.getCameraList()   # some API versions accept no arg
-        for cid in all_cams:
-            name = tde4.getCameraName(cid)
+        for cid in tde4.getCameraList():
+            try:
+                name = tde4.getCameraName(cid)
+            except Exception:
+                name = f"<cam {cid}>"
             cameras.append((cid, name))
-        return cameras
+        if cameras:
+            return cameras
     except Exception:
         pass
-
-    for pg in pgs:
-        try:
-            cams = tde4.getCameraList(pg)
-            for cid in cams:
-                try:
-                    name = tde4.getCameraName(cid)
-                    cameras.append((cid, f"{name}"))
-                except Exception:
-                    cameras.append((cid, f"<cam {cid}>"))
-        except Exception:
-            pass
+    try:
+        cam = tde4.getFirstCamera()
+        while cam:
+            try:
+                name = tde4.getCameraName(cam)
+            except Exception:
+                name = f"<cam {cam}>"
+            cameras.append((cam, name))
+            cam = tde4.getNextCamera()
+    except Exception:
+        pass
     return cameras
 
 
 def get_camera_sequence_info(cam_id: str) -> dict:
-    """
-    Return dict with keys: display_path, first_frame, last_frame, n_frames.
-
-    Uses the same strategy as cam_fetch.py:
-      - getCameraNoFrames()        → total frame count  (frames are 1-indexed)
-      - getCameraFrameFilepath()   → actual path for each frame
-      - getCameraPath()            → generic stored path for display only
-      - getCameraProxyFootage()    → proxy path fallback for display
-    """
-    info = {
-        "display_path": "",   # for UI label only; not used for actual I/O
-        "first_frame":  1,
-        "last_frame":   1,
-        "n_frames":     0,
-    }
-
-    # --- frame count (1-indexed, range is [1 .. n_frames]) ---
+    info = {"display_path": "", "first_frame": 1, "last_frame": 1, "n_frames": 0}
     try:
         n = tde4.getCameraNoFrames(cam_id)
         if n:
             info["n_frames"]   = int(n)
-            info["first_frame"] = 1
-            info["last_frame"]  = int(n)
+            info["last_frame"] = int(n)
     except Exception:
         pass
-
-    # --- display path for UI label (not used for loading) ---
-    # Priority: getCameraPath → getCameraProxyFootage → getCameraFrameFilepath(1)
     for fn_name in ("getCameraPath", "getCameraProxyFootage"):
         fn = getattr(tde4, fn_name, None)
         if fn:
@@ -589,7 +474,6 @@ def get_camera_sequence_info(cam_id: str) -> dict:
                     break
             except Exception:
                 pass
-
     if not info["display_path"] and info["n_frames"] > 0:
         try:
             p = tde4.getCameraFrameFilepath(cam_id, 1)
@@ -597,16 +481,10 @@ def get_camera_sequence_info(cam_id: str) -> dict:
                 info["display_path"] = p
         except Exception:
             pass
-
     return info
 
 
 def get_camera_frame_filepath(cam_id: str, frame: int) -> str:
-    """
-    Return the actual on-disk file path for *frame* of *cam_id*.
-    Mirrors cam_fetch.py: tde4.getCameraFrameFilepath(cam, f).
-    Returns empty string if the path cannot be determined.
-    """
     try:
         fp = tde4.getCameraFrameFilepath(cam_id, frame)
         return fp or ""
@@ -614,72 +492,51 @@ def get_camera_frame_filepath(cam_id: str, frame: int) -> str:
         return ""
 
 
-def set_camera_sequence_path(cam_id: str, new_path: str,
+def set_camera_sequence_path(cam_id: str, pattern: str,
                              first_frame: int = 1, last_frame: int = 1):
-    """
-    Update the footage path of *cam_id* in 3DE.
-    Tries the standard sequence-setter API names first.
-    As a last resort, tries setCameraFrameFilepath per frame
-    (only practical for short ranges or single images).
-    """
-    for fn_name in ("setCameraSequencePath", "setSequencePath",
-                    "setCameraImagePath", "setCameraPath"):
+    for fn_name in ("setCameraPath", "setCameraSequencePath",
+                    "setSequencePath", "setCameraImagePath"):
         fn = getattr(tde4, fn_name, None)
         if fn:
             try:
-                fn(cam_id, new_path)
+                fn(cam_id, pattern)
                 return
             except Exception:
                 pass
-
-    # Last resort: set per-frame paths when the above all fail
     set_fn = getattr(tde4, "setCameraFrameFilepath", None)
     if set_fn:
         for f in range(first_frame, last_frame + 1):
-            frame_path = expand_frame_path(new_path, f)
             try:
-                set_fn(cam_id, f, frame_path)
+                set_fn(cam_id, f, expand_frame_path(pattern, f))
             except Exception:
                 pass
         return
-
     raise RuntimeError(
-        "Could not find any 3DE API function to set the camera footage path.\n"
-        f"Please update the footage path manually to:\n{new_path}"
+        f"No 3DE API found to set camera footage path.\n"
+        f"Please set manually to:\n{pattern}"
     )
 
 
 # ---------------------------------------------------------------------------
-# Reusable slider row widget
+# Labeled float slider
 # ---------------------------------------------------------------------------
 
 class LabeledSlider(QWidget):
-    """
-    A horizontal slider with a left label, a right value spin-box,
-    and optional enable checkbox.
-    valueChanged(float) is emitted whenever the value changes.
-    """
     valueChanged = Signal(float)
 
-    def __init__(self,
-                 label: str,
-                 min_val: float, max_val: float, default: float,
-                 decimals: int = 2,
-                 parent=None):
+    def __init__(self, label: str, min_val: float, max_val: float,
+                 default: float, decimals: int = 2, parent=None):
         super().__init__(parent)
-        self._decimals = decimals
-        self._min = min_val
-        self._max = max_val
-        self._scale = 10 ** decimals        # int ↔ float conversion factor
+        self._scale = 10 ** decimals
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 1, 0, 1)
         layout.setSpacing(6)
 
         self.lbl = QLabel(label)
-        self.lbl.setFixedWidth(76)
-        self.lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-
+        self.lbl.setFixedWidth(82)
+        self.lbl.setAlignment(Qt.AlignmentFlag.AlignRight |
+                               Qt.AlignmentFlag.AlignVCenter)
         self.slider = QSlider(Qt.Orientation.Horizontal)
         self.slider.setRange(int(min_val * self._scale),
                              int(max_val * self._scale))
@@ -692,7 +549,7 @@ class LabeledSlider(QWidget):
         self.spin.setDecimals(decimals)
         self.spin.setSingleStep(10 ** -decimals)
         self.spin.setValue(default)
-        self.spin.setFixedWidth(62)
+        self.spin.setFixedWidth(64)
 
         layout.addWidget(self.lbl)
         layout.addWidget(self.slider, 1)
@@ -709,9 +566,8 @@ class LabeledSlider(QWidget):
         self.valueChanged.emit(fv)
 
     def _spin_changed(self, fv: float):
-        iv = int(round(fv * self._scale))
         self.slider.blockSignals(True)
-        self.slider.setValue(iv)
+        self.slider.setValue(int(round(fv * self._scale)))
         self.slider.blockSignals(False)
         self.valueChanged.emit(fv)
 
@@ -733,17 +589,65 @@ class LabeledSlider(QWidget):
 
 
 # ---------------------------------------------------------------------------
-# Filter Group box
+# Labeled integer slider (for NLM odd window sizes)
+# ---------------------------------------------------------------------------
+
+class LabeledIntSlider(QWidget):
+    valueChanged = Signal(float)   # emits float for uniform FilterGroup API
+
+    def __init__(self, label: str, min_val: int, max_val: int,
+                 default: int, step: int = 2, parent=None):
+        super().__init__(parent)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 1, 0, 1)
+        layout.setSpacing(6)
+
+        self.lbl = QLabel(label)
+        self.lbl.setFixedWidth(82)
+        self.lbl.setAlignment(Qt.AlignmentFlag.AlignRight |
+                               Qt.AlignmentFlag.AlignVCenter)
+        self.slider = QSlider(Qt.Orientation.Horizontal)
+        self.slider.setRange(min_val, max_val)
+        self.slider.setValue(default)
+        self.slider.setSingleStep(step)
+        self.slider.setPageStep(step * 2)
+
+        self.val_lbl = QLabel(str(default))
+        self.val_lbl.setFixedWidth(28)
+        self.val_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        layout.addWidget(self.lbl)
+        layout.addWidget(self.slider, 1)
+        layout.addWidget(self.val_lbl)
+
+        self.slider.valueChanged.connect(self._on_changed)
+
+    def _on_changed(self, v: int):
+        self.val_lbl.setText(str(v))
+        self.valueChanged.emit(float(v))
+
+    def value(self) -> float:
+        return float(self.slider.value())
+
+    def setValue(self, v):
+        self.slider.blockSignals(True)
+        self.slider.setValue(int(v))
+        self.val_lbl.setText(str(int(v)))
+        self.slider.blockSignals(False)
+
+    def setEnabled(self, enabled: bool):
+        self.slider.setEnabled(enabled)
+        super().setEnabled(enabled)
+
+
+# ---------------------------------------------------------------------------
+# Filter Group
 # ---------------------------------------------------------------------------
 
 class FilterGroup(QGroupBox):
-    """
-    A collapsible GroupBox containing an enable checkbox + parameter sliders.
-    paramsChanged() is emitted whenever any parameter changes.
-    """
     paramsChanged = Signal()
 
-    def __init__(self, title: str, sliders_cfg: list[dict], parent=None):
+    def __init__(self, title: str, parent=None):
         super().__init__(title, parent)
         self._layout = QVBoxLayout(self)
         self._layout.setContentsMargins(8, 4, 8, 6)
@@ -753,20 +657,15 @@ class FilterGroup(QGroupBox):
         self.enable_cb.setChecked(False)
         self._layout.addWidget(self.enable_cb)
 
-        self._sliders: dict[str, LabeledSlider] = {}
-        for cfg in sliders_cfg:
-            s = LabeledSlider(
-                cfg["label"],
-                cfg["min"], cfg["max"], cfg["default"],
-                cfg.get("decimals", 2)
-            )
-            s.setEnabled(False)
-            self._sliders[cfg["key"]] = s
-            self._layout.addWidget(s)
-
+        self._sliders: dict[str, LabeledSlider | LabeledIntSlider] = {}
         self.enable_cb.toggled.connect(self._on_toggle)
-        for s in self._sliders.values():
-            s.valueChanged.connect(lambda _: self.paramsChanged.emit())
+
+    def add_slider(self, key: str,
+                   slider: LabeledSlider | LabeledIntSlider):
+        slider.setEnabled(False)
+        self._sliders[key] = slider
+        self._layout.addWidget(slider)
+        slider.valueChanged.connect(lambda _: self.paramsChanged.emit())
 
     def _on_toggle(self, checked: bool):
         for s in self._sliders.values():
@@ -776,32 +675,43 @@ class FilterGroup(QGroupBox):
     def is_enabled(self) -> bool:
         return self.enable_cb.isChecked()
 
-    def get_value(self, key: str) -> float:
+    def get_value(self, key: str):
         return self._sliders[key].value()
 
-    def set_value(self, key: str, v: float):
+    def set_value(self, key: str, v):
         self._sliders[key].setValue(v)
 
-    def set_enabled(self, key: str, enabled: bool):
+    def set_group_enabled(self, enabled: bool):
+        """Set enabled state silently (no paramsChanged signal)."""
+        self.enable_cb.blockSignals(True)
         self.enable_cb.setChecked(enabled)
+        for s in self._sliders.values():
+            s.setEnabled(enabled)
+        self.enable_cb.blockSignals(False)
 
 
 # ---------------------------------------------------------------------------
-# Image Viewer
+# Image Viewer  with zoom + pan  (fix #3)
 # ---------------------------------------------------------------------------
 
 class ImageViewer(QWidget):
-    """Scales and centres an image pixmap; toggles original / filtered."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._pixmap_filtered: QPixmap | None = None
         self._pixmap_original: QPixmap | None = None
         self._show_original = False
+
+        self._zoom   = 1.0
+        self._offset = QPointF(0.0, 0.0)
+        self._drag_start: QPointF | None = None
+        self._drag_offset_start = QPointF(0.0, 0.0)
+
         self.setMinimumSize(400, 300)
         self.setSizePolicy(QSizePolicy.Policy.Expanding,
                            QSizePolicy.Policy.Expanding)
-        self.setStyleSheet("background-color: #111111;")
+        self.setStyleSheet("background-color:#111111;")
+        self.setMouseTracking(True)
 
     def set_filtered(self, pm: QPixmap):
         self._pixmap_filtered = pm
@@ -817,36 +727,162 @@ class ImageViewer(QWidget):
         self._show_original = flag
         self.update()
 
+    def reset_zoom(self):
+        self._zoom   = 1.0
+        self._offset = QPointF(0.0, 0.0)
+        self.update()
+
+    def zoom_in(self):
+        self._apply_zoom(1.25)
+
+    def zoom_out(self):
+        self._apply_zoom(0.8)
+
+    def _apply_zoom(self, factor: float, center: QPointF | None = None):
+        if center is None:
+            center = QPointF(self.width() / 2.0, self.height() / 2.0)
+        old_zoom     = self._zoom
+        self._zoom   = max(0.05, min(self._zoom * factor, 32.0))
+        scale_change = self._zoom / old_zoom
+        self._offset = center + (self._offset - center) * scale_change
+        self.update()
+
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.fillRect(self.rect(), QColor("#111111"))
         pm = (self._pixmap_original if self._show_original
               else self._pixmap_filtered)
-        if pm and not pm.isNull():
-            scaled = pm.scaled(self.size(),
-                               Qt.AspectRatioMode.KeepAspectRatio,
-                               Qt.TransformationMode.SmoothTransformation)
-            x = (self.width()  - scaled.width())  // 2
-            y = (self.height() - scaled.height()) // 2
-            painter.drawPixmap(x, y, scaled)
-        else:
+        if not pm or pm.isNull():
             painter.setPen(QColor("#555555"))
-            painter.drawText(self.rect(),
-                             Qt.AlignmentFlag.AlignCenter,
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter,
                              "No image loaded")
+            return
+        dw = pm.width()  * self._zoom
+        dh = pm.height() * self._zoom
+        x  = (self.width()  - dw) / 2 + self._offset.x()
+        y  = (self.height() - dh) / 2 + self._offset.y()
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        painter.drawPixmap(int(x), int(y), int(dw), int(dh), pm)
+        painter.setPen(QColor(180, 180, 180, 160))
+        painter.drawText(6, self.height() - 6, f"{self._zoom * 100:.0f}%")
 
     def resizeEvent(self, event):
         self.update()
 
+    def wheelEvent(self, event: QWheelEvent):
+        delta  = event.angleDelta().y()
+        factor = 1.12 if delta > 0 else (1.0 / 1.12)
+        self._apply_zoom(factor, QPointF(event.position()))
+        event.accept()
+
+    def mousePressEvent(self, event):
+        if event.button() in (Qt.MouseButton.MiddleButton,
+                               Qt.MouseButton.LeftButton):
+            self._drag_start        = QPointF(event.position())
+            self._drag_offset_start = QPointF(self._offset)
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+
+    def mouseMoveEvent(self, event):
+        if self._drag_start is not None:
+            delta        = QPointF(event.position()) - self._drag_start
+            self._offset = self._drag_offset_start + delta
+            self.update()
+
+    def mouseReleaseEvent(self, event):
+        self._drag_start = None
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+
+    def mouseDoubleClickEvent(self, event):
+        self.reset_zoom()
+
 
 # ---------------------------------------------------------------------------
-# Background export thread
+# Background threads
 # ---------------------------------------------------------------------------
+
+class FrameLoaderThread(QThread):
+    """
+    Loads one EXR frame from disk without blocking the main thread.
+    fix #4: frame slider crash was caused by synchronous disk I/O on the
+    main thread locking Qt/3DE's event loop.
+    """
+    loaded = Signal(object, str, int)   # (np.ndarray pixels, path, frame)
+    error  = Signal(str, int)
+
+    def __init__(self, cam_id: str, frame: int):
+        super().__init__()
+        self._cam_id = cam_id
+        self._frame  = frame
+        self._abort  = False
+
+    def abort(self):
+        self._abort = True
+
+    def run(self):
+        if self._abort:
+            return
+        path = get_camera_frame_filepath(self._cam_id, self._frame)
+        if not path:
+            self.error.emit(
+                f"Frame {self._frame}: getCameraFrameFilepath returned empty.",
+                self._frame)
+            return
+        try:
+            pixels, _ = ImageIO.load(path)
+            if not self._abort:
+                self.loaded.emit(pixels, path, self._frame)
+        except Exception as e:
+            if not self._abort:
+                self.error.emit(str(e), self._frame)
+
+
+class PreviewThread(QThread):
+    """
+    Runs filter stack + tonemapping in a background thread.
+    fix #4: never blocks main thread.
+    fix #6: emits done so _on_preview_done can re-trigger if dirty.
+    """
+    done  = Signal(object, object)   # orig_uint8, filtered_uint8 (np arrays)
+    error = Signal(str)
+
+    def __init__(self, img_float: np.ndarray,
+                 params: FilterParams, exposure: float):
+        super().__init__()
+        self._img      = img_float
+        self._params   = params.copy()
+        self._exposure = exposure
+        self._abort    = False
+
+    def abort(self):
+        self._abort = True
+
+    def run(self):
+        try:
+            small = downscale_for_preview(self._img)   # fix #1
+            if self._abort:
+                return
+            orig_u8 = tonemap_display(small, self._exposure)
+            if self._abort:
+                return
+            filtered = ImageProcessor.process(small, self._params)
+            if self._abort:
+                return
+            filt_u8  = tonemap_display(filtered, self._exposure)
+            if not self._abort:
+                self.done.emit(orig_u8, filt_u8)
+        except Exception as e:
+            if not self._abort:
+                self.error.emit(
+                    f"{type(e).__name__}: {e}\n{traceback.format_exc()}")
+
 
 class ExportThread(QThread):
-    progress     = Signal(int, str)     # (frames_done, message)
-    finished_ok  = Signal(str, str)     # (output_dir, first_output_path)
-    error        = Signal(str)
+    """
+    Full-resolution export with parallel frame processing (fix #1).
+    """
+    progress    = Signal(int, str)       # (frames_done, message)
+    finished_ok = Signal(str, str)       # (output_dir, #### pattern)
+    error       = Signal(str)
 
     def __init__(self, cam_id: str, output_dir: str,
                  first: int, last: int, params: FilterParams):
@@ -861,111 +897,104 @@ class ExportThread(QThread):
     def abort(self):
         self._abort = True
 
+    def _process_frame(self, frame: int) -> tuple[bool, str]:
+        if self._abort:
+            return False, ""
+        in_path = get_camera_frame_filepath(self._cam_id, frame)
+        if not in_path:
+            return True, ""
+        out_path = os.path.join(self._output_dir, os.path.basename(in_path))
+        try:
+            pixels, meta = ImageIO.load(in_path)
+            filtered     = ImageProcessor.process(pixels, self._params)
+            ImageIO.save(out_path, filtered, meta)
+            return True, out_path
+        except FileNotFoundError:
+            return True, ""
+        except Exception as e:
+            raise RuntimeError(f"Frame {frame}: {e}") from e
+
     def run(self):
         try:
             os.makedirs(self._output_dir, exist_ok=True)
-            total           = self._last - self._first + 1
-            first_out_path  = ""
-            frames_done     = 0
+            frames      = list(range(self._first, self._last + 1))
+            total       = len(frames)
+            first_out   = ""
+            frames_done = 0
 
-            for frame in range(self._first, self._last + 1):
-                if self._abort:
-                    self.error.emit("Export cancelled.")
-                    return
-
-                # ── resolve input path using the same API as cam_fetch.py ──
-                in_path = get_camera_frame_filepath(self._cam_id, frame)
-                if not in_path:
-                    # frame has no path registered – skip silently
+            max_workers = min(4, os.cpu_count() or 2)
+            with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=max_workers) as pool:
+                future_map = {pool.submit(self._process_frame, f): f
+                              for f in frames}
+                for future in concurrent.futures.as_completed(future_map):
+                    if self._abort:
+                        pool.shutdown(wait=False, cancel_futures=True)
+                        self.error.emit("Export cancelled.")
+                        return
+                    ok, out_path = future.result()
+                    if out_path and not first_out:
+                        first_out = out_path
                     frames_done += 1
-                    self.progress.emit(frames_done,
-                                       f"Frame {frame} – no path, skipped")
-                    continue
+                    f = future_map[future]
+                    self.progress.emit(
+                        frames_done,
+                        f"Frame {f}  ({frames_done}/{total})  "
+                        f"-> {os.path.basename(out_path) if out_path else 'skipped'}"
+                    )
 
-                # ── mirror the filename into output_dir ──
-                out_path = os.path.join(
-                    self._output_dir, os.path.basename(in_path))
-
-                if not first_out_path:
-                    first_out_path = out_path
-
-                msg = (f"Frame {frame}  "
-                       f"({frames_done + 1}/{total})  "
-                       f"→  {os.path.basename(out_path)}")
-                self.progress.emit(frames_done, msg)
-
-                try:
-                    pixels, meta = ImageIO.load(in_path)
-                except FileNotFoundError:
-                    frames_done += 1
-                    self.progress.emit(frames_done,
-                                       f"Frame {frame} – file not found, skipped")
-                    continue
-
-                filtered = ImageProcessor.process(pixels, self._params)
-                ImageIO.save(out_path, filtered, meta)
-                frames_done += 1
-
-            self.finished_ok.emit(self._output_dir, first_out_path)
+            # fix #5: build #### pattern from first exported path
+            out_pattern = make_sequence_pattern(first_out) if first_out else ""
+            self.finished_ok.emit(self._output_dir, out_pattern)
 
         except Exception as e:
-            self.error.emit(f"{type(e).__name__}: {e}\n{traceback.format_exc()}")
+            self.error.emit(
+                f"{type(e).__name__}: {e}\n{traceback.format_exc()}")
 
 
 # ---------------------------------------------------------------------------
-# Preview update worker (runs in a thread to keep UI responsive)
-# ---------------------------------------------------------------------------
-
-class PreviewThread(QThread):
-    done = Signal(np.ndarray, np.ndarray)  # (original_uint8, filtered_uint8)
-    error = Signal(str)
-
-    def __init__(self, img_float: np.ndarray,
-                 params: FilterParams, exposure: float):
-        super().__init__()
-        self._img     = img_float
-        self._params  = params.copy()
-        self._exposure = exposure
-
-    def run(self):
-        try:
-            orig     = tonemap_display(self._img, self._exposure)
-            filtered = ImageProcessor.process(self._img, self._params)
-            filt_tm  = tonemap_display(filtered, self._exposure)
-            self.done.emit(orig, filt_tm)
-        except Exception as e:
-            self.error.emit(str(e))
-
-
-# ---------------------------------------------------------------------------
-# Main filter window
+# Main window
 # ---------------------------------------------------------------------------
 
 class FilterToolkitWindow(QMainWindow):
+
     def __init__(self, cam_id: str, cam_name: str):
         super().__init__()
         self.setWindowTitle(
-            f"R_Tools  •  Image Filter Toolkit  •  [{cam_name}]"
-        )
-        self.resize(1420, 860)
+            f"R_Tools  Image Filter Toolkit  v2.0  [{cam_name}]")
+        self.resize(1480, 900)
         self.setStyleSheet(DARK_STYLE)
 
         self._cam_id   = cam_id
         self._cam_name = cam_name
         self._seq_info = get_camera_sequence_info(cam_id)
+
         self._current_frame_img: np.ndarray | None = None
-        self._preview_thread: PreviewThread | None = None
-        self._export_thread:  ExportThread  | None = None
-        self._debounce_timer = QTimer()
-        self._debounce_timer.setSingleShot(True)
-        self._debounce_timer.timeout.connect(self._trigger_preview)
+        self._current_frame: int = self._seq_info["first_frame"]
+        self._pending_frame: int = self._seq_info["first_frame"]
+
+        self._loader_thread:  FrameLoaderThread | None = None
+        self._preview_thread: PreviewThread     | None = None
+        self._export_thread:  ExportThread      | None = None
+        self._preview_dirty = False   # fix #6
+
+        # fix #4: debounce frame loading so slider drag doesn't spawn a thread
+        # per pixel moved
+        self._frame_debounce = QTimer()
+        self._frame_debounce.setSingleShot(True)
+        self._frame_debounce.timeout.connect(self._do_load_frame)
+
+        self._preview_debounce = QTimer()
+        self._preview_debounce.setSingleShot(True)
+        self._preview_debounce.timeout.connect(self._trigger_preview)
 
         self._params = FilterParams()
-
         self._build_ui()
-        self._load_frame(self._seq_info["first_frame"])
 
-    # ------------------------------------------------------------------ UI --
+        # Kick off first frame load asynchronously
+        self._do_load_frame()
+
+    # ================================================================= UI ===
 
     def _build_ui(self):
         central = QWidget()
@@ -977,130 +1006,129 @@ class FilterToolkitWindow(QMainWindow):
         # ── Left control panel ──────────────────────────────────────────────
         ctrl_scroll = QScrollArea()
         ctrl_scroll.setWidgetResizable(True)
-        ctrl_scroll.setFixedWidth(310)
+        ctrl_scroll.setFixedWidth(326)
         ctrl_scroll.setHorizontalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-
         ctrl_widget = QWidget()
         ctrl_layout = QVBoxLayout(ctrl_widget)
         ctrl_layout.setContentsMargins(10, 10, 10, 10)
         ctrl_layout.setSpacing(6)
         ctrl_scroll.setWidget(ctrl_widget)
 
-        # Camera info label
+        # Camera info
         info_lbl = QLabel(
             f"<b>{self._cam_name}</b><br>"
             f"<span style='color:#888;font-size:10px;'>"
-            f"{self._seq_info['display_path'] or 'No footage path detected'}</span>"
-        )
+            f"{self._seq_info['display_path'] or 'No footage path detected'}"
+            f"</span>")
         info_lbl.setWordWrap(True)
         ctrl_layout.addWidget(info_lbl)
+        ctrl_layout.addWidget(self._sep())
 
-        ctrl_layout.addWidget(self._make_separator())
-
-        # ── Frame Selector ──────────────────────────────────────────────────
+        # Frame selector
         frame_grp = QGroupBox("Frame")
-        frame_layout = QVBoxLayout(frame_grp)
-        frame_layout.setSpacing(4)
-
+        fl = QVBoxLayout(frame_grp)
+        fl.setSpacing(4)
         self._frame_display = QLabel(str(self._seq_info["first_frame"]))
         self._frame_display.setObjectName("frame_label")
-        frame_layout.addWidget(self._frame_display)
+        fl.addWidget(self._frame_display)
 
         self._frame_slider = QSlider(Qt.Orientation.Horizontal)
-        self._frame_slider.setRange(self._seq_info["first_frame"],
-                                    self._seq_info["last_frame"])
-        self._frame_slider.setValue(self._seq_info["first_frame"])
+        first = self._seq_info["first_frame"]
+        last  = max(self._seq_info["last_frame"], first + 1)
+        self._frame_slider.setRange(first, last)
+        self._frame_slider.setValue(first)
         self._frame_slider.setSingleStep(1)
-        self._frame_slider.setTickPosition(QSlider.TickPosition.NoTicks)
-        self._frame_slider.valueChanged.connect(self._on_frame_changed)
-        frame_layout.addWidget(self._frame_slider)
+        # fix #4: debounced — does NOT call _load_frame directly
+        self._frame_slider.valueChanged.connect(self._on_frame_slider_changed)
+        fl.addWidget(self._frame_slider)
 
-        frame_range_lbl = QLabel(
-            f"Range:  {self._seq_info['first_frame']}  –  "
-            f"{self._seq_info['last_frame']}")
-        frame_range_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        frame_range_lbl.setStyleSheet("color:#777;font-size:10px;")
-        frame_layout.addWidget(frame_range_lbl)
+        rng_lbl = QLabel(f"Range:  {first}  –  {self._seq_info['last_frame']}")
+        rng_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        rng_lbl.setStyleSheet("color:#777;font-size:10px;")
+        fl.addWidget(rng_lbl)
         ctrl_layout.addWidget(frame_grp)
 
-        # ── Display Exposure (preview only) ─────────────────────────────────
+        # Display options
         disp_grp = QGroupBox("Display  (preview only)")
-        disp_lay = QVBoxLayout(disp_grp)
-        disp_lay.setSpacing(2)
-
-        self._exposure_slider = LabeledSlider("Exposure", -6.0, 6.0, 0.0,
-                                              decimals=2)
+        dl = QVBoxLayout(disp_grp)
+        dl.setSpacing(2)
+        self._exposure_slider = LabeledSlider("Exposure", -6.0, 6.0, 0.0, 2)
         self._exposure_slider.valueChanged.connect(
             lambda _: self._schedule_preview())
-        disp_lay.addWidget(self._exposure_slider)
+        dl.addWidget(self._exposure_slider)
 
         self._compare_btn = QPushButton("Hold  [ Original ]")
         self._compare_btn.setCheckable(True)
         self._compare_btn.toggled.connect(self._on_compare_toggled)
-        disp_lay.addWidget(self._compare_btn)
+        dl.addWidget(self._compare_btn)
         ctrl_layout.addWidget(disp_grp)
+        ctrl_layout.addWidget(self._sep())
 
-        ctrl_layout.addWidget(self._make_separator())
+        # ── Filter groups ────────────────────────────────────────────────────
+        ctrl_layout.addWidget(self._section("FILTERS  (applied in order)"))
 
-        # ── Filter Groups ────────────────────────────────────────────────────
-        ctrl_layout.addWidget(
-            self._make_section_title("FILTERS"))
+        # 1. Denoise  (fix #2)
+        self._denoise_grp = FilterGroup("①  Denoise  (NL-Means)")
+        self._denoise_grp.add_slider("h",
+            LabeledSlider("Lum. str.",   1.0, 30.0, 10.0, decimals=1))
+        self._denoise_grp.add_slider("hcolor",
+            LabeledSlider("Color str.",  1.0, 30.0, 10.0, decimals=1))
+        self._denoise_grp.add_slider("template_win",
+            LabeledIntSlider("Tmpl win", 3, 21, 7, step=2))
+        self._denoise_grp.add_slider("search_win",
+            LabeledIntSlider("Search win", 7, 35, 21, step=2))
+        self._denoise_grp.paramsChanged.connect(self._on_filter_changed)
+        if not HAS_CV2:
+            self._denoise_grp.setToolTip(
+                "OpenCV not installed — denoising unavailable.\n"
+                "pip install opencv-python")
+            self._denoise_grp.setEnabled(False)
+        ctrl_layout.addWidget(self._denoise_grp)
 
-        self._sharpen_grp = FilterGroup(
-            "Sharpness  (Unsharp Mask)",
-            [
-                {"key": "amount", "label": "Amount",
-                 "min": 0.0, "max": 3.0, "default": 1.0, "decimals": 2},
-                {"key": "radius", "label": "Radius px",
-                 "min": 0.3, "max": 5.0, "default": 1.0, "decimals": 2},
-            ]
-        )
+        # 2. Sharpness
+        self._sharpen_grp = FilterGroup("②  Sharpness  (Unsharp Mask)")
+        self._sharpen_grp.add_slider("amount",
+            LabeledSlider("Amount",    0.0, 3.0, 1.0, decimals=2))
+        self._sharpen_grp.add_slider("radius",
+            LabeledSlider("Radius px", 0.3, 5.0, 1.0, decimals=2))
         self._sharpen_grp.paramsChanged.connect(self._on_filter_changed)
         ctrl_layout.addWidget(self._sharpen_grp)
 
-        self._highpass_grp = FilterGroup(
-            "High-Pass  (Detail Layer)",
-            [
-                {"key": "amount", "label": "Amount",
-                 "min": 0.0, "max": 2.0, "default": 0.5, "decimals": 2},
-                {"key": "radius", "label": "Radius px",
-                 "min": 1.0, "max": 25.0, "default": 5.0, "decimals": 1},
-            ]
-        )
+        # 3. High-Pass
+        self._highpass_grp = FilterGroup("③  High-Pass  (Detail Layer)")
+        self._highpass_grp.add_slider("amount",
+            LabeledSlider("Amount",    0.0, 2.0, 0.5, decimals=2))
+        self._highpass_grp.add_slider("radius",
+            LabeledIntSlider("Radius px", 1, 25, 5, step=1))
         self._highpass_grp.paramsChanged.connect(self._on_filter_changed)
         ctrl_layout.addWidget(self._highpass_grp)
 
-        self._contrast_grp = FilterGroup(
-            "Contrast  /  Brightness",
-            [
-                {"key": "contrast",   "label": "Contrast",
-                 "min": 0.25, "max": 3.0, "default": 1.0, "decimals": 2},
-                {"key": "brightness", "label": "Brightness",
-                 "min": -1.0, "max": 1.0, "default": 0.0, "decimals": 3},
-            ]
-        )
+        # 4. Contrast
+        self._contrast_grp = FilterGroup("④  Contrast  /  Brightness")
+        self._contrast_grp.add_slider("contrast",
+            LabeledSlider("Contrast",   0.25, 3.0, 1.0, decimals=2))
+        self._contrast_grp.add_slider("brightness",
+            LabeledSlider("Brightness", -1.0, 1.0, 0.0, decimals=3))
         self._contrast_grp.paramsChanged.connect(self._on_filter_changed)
         ctrl_layout.addWidget(self._contrast_grp)
 
-        ctrl_layout.addWidget(self._make_separator())
+        ctrl_layout.addWidget(self._sep())
 
-        # ── Export ───────────────────────────────────────────────────────────
-        ctrl_layout.addWidget(self._make_section_title("EXPORT"))
+        # ── Export ──────────────────────────────────────────────────────────
+        ctrl_layout.addWidget(self._section("EXPORT"))
 
-        out_dir_grp = QGroupBox("Output Directory")
-        out_dir_lay = QVBoxLayout(out_dir_grp)
-
-        self._out_dir_edit = QLineEdit(suggest_output_dir(self._seq_info["display_path"]))
-        self._out_dir_edit.setPlaceholderText("/path/to/output_folder")
-        out_dir_lay.addWidget(self._out_dir_edit)
-
+        out_grp = QGroupBox("Output Directory")
+        ol = QVBoxLayout(out_grp)
+        self._out_dir_edit = QLineEdit(
+            suggest_output_dir(self._seq_info["display_path"]))
+        self._out_dir_edit.setPlaceholderText("/path/to/filtered_output")
+        ol.addWidget(self._out_dir_edit)
         browse_btn = QPushButton("Browse…")
         browse_btn.clicked.connect(self._browse_output_dir)
-        out_dir_lay.addWidget(browse_btn)
-        ctrl_layout.addWidget(out_dir_grp)
+        ol.addWidget(browse_btn)
+        ctrl_layout.addWidget(out_grp)
 
-        # Reset + Export buttons
         btn_row = QHBoxLayout()
         reset_btn = QPushButton("Reset All")
         reset_btn.setObjectName("reset_btn")
@@ -1113,48 +1141,119 @@ class FilterToolkitWindow(QMainWindow):
         btn_row.addWidget(self._export_btn, 1)
         ctrl_layout.addLayout(btn_row)
 
-        # Status / info
         self._status_lbl = QLabel("Ready.")
         self._status_lbl.setObjectName("status_label")
         self._status_lbl.setWordWrap(True)
         ctrl_layout.addWidget(self._status_lbl)
-
         ctrl_layout.addStretch(1)
 
-        # ── Right image viewer ───────────────────────────────────────────────
+        # ── Right: zoom bar + viewer ─────────────────────────────────────────
+        viewer_container = QWidget()
+        vc_layout = QVBoxLayout(viewer_container)
+        vc_layout.setContentsMargins(0, 0, 0, 0)
+        vc_layout.setSpacing(0)
+
+        # Zoom toolbar  (fix #3)
+        zoom_bar = QWidget()
+        zoom_bar.setFixedHeight(30)
+        zoom_bar.setStyleSheet("background:#1a1a1a;")
+        zbl = QHBoxLayout(zoom_bar)
+        zbl.setContentsMargins(6, 2, 6, 2)
+        zbl.setSpacing(4)
+        for txt, cb in (
+            ("−",   lambda: self._viewer.zoom_out()),
+            ("+",   lambda: self._viewer.zoom_in()),
+            ("1:1", lambda: self._set_zoom_1to1()),
+            ("Fit", lambda: self._viewer.reset_zoom()),
+        ):
+            b = QPushButton(txt)
+            b.setObjectName("zoom_btn")
+            b.setFixedWidth(36)
+            b.clicked.connect(cb)
+            zbl.addWidget(b)
+        zbl.addStretch(1)
+        hint = QLabel("Scroll = zoom  ·  Drag = pan  ·  Dbl-click = fit")
+        hint.setStyleSheet("color:#555;font-size:10px;")
+        zbl.addWidget(hint)
+
         self._viewer = ImageViewer()
+        vc_layout.addWidget(zoom_bar)
+        vc_layout.addWidget(self._viewer, 1)
 
         root.addWidget(ctrl_scroll)
-        root.addWidget(self._viewer, 1)
+        root.addWidget(viewer_container, 1)
 
-        # ── Status bar ───────────────────────────────────────────────────────
+        # Status bar
         self._statusbar = QStatusBar()
         self.setStatusBar(self._statusbar)
-        backend = ("OIIO" if HAS_OIIO
-                   else "OpenCV" if HAS_CV2
-                   else "No backend!")
-        self._statusbar.showMessage(
-            f"Backend: {backend}  |  Python {sys.version.split()[0]}  |"
-            f"  scipy: {HAS_SCIPY}"
-        )
+        caps = []
+        caps.append("OIIO ✓" if HAS_OIIO else "OIIO ✗ (REQUIRED)")
+        caps.append("OpenCV ✓" if HAS_CV2   else "OpenCV ✗ (denoise off)")
+        if HAS_SCIPY:  caps.append("scipy ✓")
+        if HAS_CUPY:   caps.append("GPU/CuPy ✓")
+        self._statusbar.showMessage("  |  ".join(caps))
 
-    def _make_separator(self) -> QFrame:
+    def _sep(self) -> QFrame:
         f = QFrame()
         f.setObjectName("separator")
         f.setFrameShape(QFrame.Shape.HLine)
         f.setFixedHeight(1)
         return f
 
-    def _make_section_title(self, text: str) -> QLabel:
+    def _section(self, text: str) -> QLabel:
         lbl = QLabel(text)
         lbl.setObjectName("section_title")
         return lbl
 
-    # ---------------------------------------------------------------- Slots --
+    def _set_zoom_1to1(self):
+        self._viewer._zoom   = 1.0
+        self._viewer._offset = QPointF(0.0, 0.0)
+        self._viewer.update()
 
-    def _on_frame_changed(self, frame: int):
+    # ============================================================== Slots ===
+
+    def _on_frame_slider_changed(self, frame: int):
+        """fix #4: only update label immediately; debounce the actual load."""
         self._frame_display.setText(str(frame))
-        self._load_frame(frame)
+        self._pending_frame = frame
+        self._frame_debounce.stop()
+        self._frame_debounce.start(180)
+
+    def _do_load_frame(self):
+        """Start background EXR load (fix #4)."""
+        frame = self._pending_frame
+        self._current_frame = frame
+
+        # Abort stale loader
+        if self._loader_thread and self._loader_thread.isRunning():
+            self._loader_thread.abort()
+            try:
+                self._loader_thread.loaded.disconnect()
+                self._loader_thread.error.disconnect()
+            except Exception:
+                pass
+
+        self._set_status(f"Loading frame {frame} …")
+        t = FrameLoaderThread(self._cam_id, frame)
+        t.loaded.connect(self._on_frame_loaded)
+        t.error.connect(self._on_frame_load_error)
+        self._loader_thread = t
+        t.start()
+
+    def _on_frame_loaded(self, pixels: np.ndarray, path: str, frame: int):
+        if frame != self._current_frame:
+            return   # stale result from aborted load
+        self._current_frame_img = pixels
+        self._set_status(
+            f"Frame {frame}   {pixels.shape[1]}x{pixels.shape[0]}"
+            f"  ch:{pixels.shape[2]}   {os.path.basename(path)}")
+        self._schedule_preview(immediate=True)
+
+    def _on_frame_load_error(self, msg: str, frame: int):
+        if frame != self._current_frame:
+            return
+        self._current_frame_img = None
+        self._set_status(f"Load error: {msg}")
 
     def _on_filter_changed(self):
         self._collect_params()
@@ -1166,75 +1265,69 @@ class FilterToolkitWindow(QMainWindow):
                                   else "Hold  [ Original ]")
 
     def _browse_output_dir(self):
-        d = QFileDialog.getExistingDirectory(self, "Select Output Directory",
-                                             self._out_dir_edit.text())
+        d = QFileDialog.getExistingDirectory(
+            self, "Select Output Directory", self._out_dir_edit.text())
         if d:
             self._out_dir_edit.setText(d)
 
     def _reset_params(self):
-        self._sharpen_grp.set_enabled("enabled", False)
-        self._sharpen_grp.set_value("amount", 1.0)
-        self._sharpen_grp.set_value("radius", 1.0)
-        self._highpass_grp.set_enabled("enabled", False)
-        self._highpass_grp.set_value("amount", 0.5)
-        self._highpass_grp.set_value("radius", 5.0)
-        self._contrast_grp.set_enabled("enabled", False)
-        self._contrast_grp.set_value("contrast",   1.0)
-        self._contrast_grp.set_value("brightness", 0.0)
-        self._exposure_slider.setValue(0.0)
-        self._collect_params()
-        self._schedule_preview()
+        """Reset all params silently, then force a single re-render (fix #6)."""
+        for grp in (self._denoise_grp, self._sharpen_grp,
+                    self._highpass_grp, self._contrast_grp):
+            grp.set_group_enabled(False)
 
-    # ---------------------------------------------------------------- Logic --
+        self._denoise_grp.set_value("h",            10.0)
+        self._denoise_grp.set_value("hcolor",        10.0)
+        self._denoise_grp.set_value("template_win",  7)
+        self._denoise_grp.set_value("search_win",    21)
+        self._sharpen_grp.set_value("amount",        1.0)
+        self._sharpen_grp.set_value("radius",        1.0)
+        self._highpass_grp.set_value("amount",       0.5)
+        self._highpass_grp.set_value("radius",       5)
+        self._contrast_grp.set_value("contrast",     1.0)
+        self._contrast_grp.set_value("brightness",   0.0)
+        self._exposure_slider.setValue(0.0)
+
+        self._collect_params()
+        self._schedule_preview(immediate=True)   # fix #6: force re-render now
+
+    # ============================================================= Logic ===
 
     def _collect_params(self):
-        self._params.sharpen_enabled  = self._sharpen_grp.is_enabled()
-        self._params.sharpen_amount   = self._sharpen_grp.get_value("amount")
-        self._params.sharpen_radius   = self._sharpen_grp.get_value("radius")
-        self._params.highpass_enabled = self._highpass_grp.is_enabled()
-        self._params.highpass_amount  = self._highpass_grp.get_value("amount")
-        self._params.highpass_radius  = self._highpass_grp.get_value("radius")
-        self._params.contrast_enabled = self._contrast_grp.is_enabled()
-        self._params.contrast_value   = self._contrast_grp.get_value("contrast")
-        self._params.brightness_value = self._contrast_grp.get_value("brightness")
+        p = self._params
+        p.denoise_enabled         = self._denoise_grp.is_enabled()
+        p.denoise_h               = self._denoise_grp.get_value("h")
+        p.denoise_hcolor          = self._denoise_grp.get_value("hcolor")
+        p.denoise_template_window = int(self._denoise_grp.get_value("template_win"))
+        p.denoise_search_window   = int(self._denoise_grp.get_value("search_win"))
+        p.sharpen_enabled         = self._sharpen_grp.is_enabled()
+        p.sharpen_amount          = self._sharpen_grp.get_value("amount")
+        p.sharpen_radius          = self._sharpen_grp.get_value("radius")
+        p.highpass_enabled        = self._highpass_grp.is_enabled()
+        p.highpass_amount         = self._highpass_grp.get_value("amount")
+        p.highpass_radius         = float(self._highpass_grp.get_value("radius"))
+        p.contrast_enabled        = self._contrast_grp.is_enabled()
+        p.contrast_value          = self._contrast_grp.get_value("contrast")
+        p.brightness_value        = self._contrast_grp.get_value("brightness")
 
-    def _load_frame(self, frame: int):
-        # Use the same per-frame API as cam_fetch.py
-        path = get_camera_frame_filepath(self._cam_id, frame)
-        if not path:
-            self._set_status(
-                f"Frame {frame}: no filepath returned by 3DE "
-                f"(getCameraFrameFilepath returned empty).")
-            self._current_frame_img = None
-            return
-
-        self._set_status(f"Loading  {os.path.basename(path)} …")
-        try:
-            pixels, _ = ImageIO.load(path)
-            self._current_frame_img = pixels
-            self._set_status(
-                f"Frame {frame}   {pixels.shape[1]}×{pixels.shape[0]}"
-                f"  ch:{pixels.shape[2]}   {os.path.basename(path)}"
-            )
-            self._schedule_preview(immediate=True)
-        except Exception as e:
-            self._current_frame_img = None
-            self._set_status(f"⚠  {e}")
-
-    def _schedule_preview(self, immediate=False):
-        """Debounced preview update (200 ms)."""
-        self._debounce_timer.stop()
+    def _schedule_preview(self, immediate: bool = False):
+        self._preview_debounce.stop()
         if immediate:
             self._trigger_preview()
         else:
-            self._debounce_timer.start(200)
+            self._preview_debounce.start(220)
 
     def _trigger_preview(self):
+        """
+        Launch preview render thread.
+        fix #6: if already running, mark dirty so _on_preview_done re-triggers.
+        """
         if self._current_frame_img is None:
             return
         if self._preview_thread and self._preview_thread.isRunning():
-            return    # let previous thread finish; a new one starts on next slider settle
-
+            self._preview_dirty = True
+            return
+        self._preview_dirty = False
         self._collect_params()
         t = PreviewThread(self._current_frame_img, self._params,
                           self._exposure_slider.value())
@@ -1243,15 +1336,16 @@ class FilterToolkitWindow(QMainWindow):
         self._preview_thread = t
         t.start()
 
-    def _on_preview_done(self, orig_u8: np.ndarray, filt_u8: np.ndarray):
+    def _on_preview_done(self, orig_u8, filt_u8):
         self._viewer.set_original(numpy_to_qpixmap(orig_u8))
         self._viewer.set_filtered(numpy_to_qpixmap(filt_u8))
         self._preview_thread = None
-        # If slider changed while processing, re-trigger
-        if self._debounce_timer.isActive():
-            pass   # timer will fire soon anyway
+        # fix #6: re-render if params changed while previous render was running
+        if self._preview_dirty:
+            self._preview_dirty = False
+            self._trigger_preview()
 
-    # ---------------------------------------------------------------- Export -
+    # ============================================================= Export ===
 
     def _start_export(self):
         if self._seq_info["n_frames"] == 0:
@@ -1259,7 +1353,6 @@ class FilterToolkitWindow(QMainWindow):
                                 "This camera has no frames registered in 3DE.\n"
                                 "(getCameraNoFrames returned 0)")
             return
-
         out_dir = self._out_dir_edit.text().strip()
         if not out_dir:
             QMessageBox.warning(self, "No Output Directory",
@@ -1267,14 +1360,13 @@ class FilterToolkitWindow(QMainWindow):
             return
 
         total = self._seq_info["last_frame"] - self._seq_info["first_frame"] + 1
-        reply = QMessageBox.question(
+        if QMessageBox.question(
             self, "Confirm Export",
             f"Export  <b>{total}</b>  frame(s) to:<br><br>"
             f"<tt>{out_dir}</tt><br><br>"
-            f"After export, 3DE camera footage path will be updated automatically.",
+            f"3DE footage path will be updated automatically after export.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel
-        )
-        if reply != QMessageBox.StandardButton.Yes:
+        ) != QMessageBox.StandardButton.Yes:
             return
 
         self._collect_params()
@@ -1305,24 +1397,22 @@ class FilterToolkitWindow(QMainWindow):
         if self._export_thread:
             self._export_thread.abort()
 
-    def _on_export_progress(self, idx: int, msg: str):
+    def _on_export_progress(self, done: int, msg: str):
         if hasattr(self, "_progress_dlg"):
-            self._progress_dlg.setValue(idx + 1)
+            self._progress_dlg.setValue(done)
             self._progress_dlg.setLabelText(msg)
         self._set_status(msg)
 
-    def _on_export_done(self, output_dir: str, first_out_path: str):
+    def _on_export_done(self, output_dir: str, out_pattern: str):
         self._export_btn.setEnabled(True)
         if hasattr(self, "_progress_dlg"):
             self._progress_dlg.close()
 
-        # Update 3DE camera footage path
-        # We pass the first exported frame's path; set_camera_sequence_path
-        # tries the standard API names and falls back to per-frame setCameraFrameFilepath.
+        # Update 3DE camera footage path using #### pattern  (fix #5)
         try:
             set_camera_sequence_path(
                 self._cam_id,
-                first_out_path,
+                out_pattern,
                 self._seq_info["first_frame"],
                 self._seq_info["last_frame"],
             )
@@ -1330,47 +1420,54 @@ class FilterToolkitWindow(QMainWindow):
                 tde4.updateGUI(0)
             except Exception:
                 pass
-            # Refresh display path in our local info cache
-            self._seq_info["display_path"] = first_out_path
-            msg = (f"✔  Export complete.\n"
-                   f"3DE footage path updated to:\n{output_dir}")
-            self._set_status(msg.replace("\n", "  "))
-            QMessageBox.information(self, "Export Complete",
-                                    f"Frames written to:\n{output_dir}\n\n"
-                                    f"3DE footage path updated successfully.")
+            self._seq_info["display_path"] = out_pattern
+            self._set_status(f"Export done. Pattern: {out_pattern}")
+            QMessageBox.information(
+                self, "Export Complete",
+                f"Frames written to:\n{output_dir}\n\n"
+                f"3DE footage path updated to:\n{out_pattern}"
+            )
         except Exception as e:
-            self._set_status(f"Export done but could not update 3DE: {e}")
+            self._set_status(f"Export done – 3DE update failed: {e}")
             QMessageBox.warning(
                 self, "3DE Update Failed",
-                f"Frames exported to:\n{output_seq_path}\n\n"
+                f"Frames exported to:\n{output_dir}\n\n"
                 f"Could not update 3DE camera path automatically:\n{e}\n\n"
-                f"Please update the footage path manually in 3DE."
+                f"Please set the footage path manually to:\n{out_pattern}"
             )
+
+        # fix #6: reload current frame from new location to re-enable preview
+        self._pending_frame = self._current_frame
+        self._do_load_frame()
 
     def _on_export_error(self, msg: str):
         self._export_btn.setEnabled(True)
         if hasattr(self, "_progress_dlg"):
             self._progress_dlg.close()
-        self._set_status(f"⚠  Export failed.")
+        self._set_status("Export failed.")
         QMessageBox.critical(self, "Export Error", msg)
 
     def _set_status(self, msg: str):
         self._status_lbl.setText(msg)
-        self._statusbar.showMessage(msg, 6000)
+        self._statusbar.showMessage(msg, 8000)
 
     def closeEvent(self, event):
         if self._export_thread and self._export_thread.isRunning():
-            reply = QMessageBox.question(
+            if QMessageBox.question(
                 self, "Export Running",
                 "An export is in progress. Cancel and close?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-            )
-            if reply == QMessageBox.StandardButton.Yes:
+            ) == QMessageBox.StandardButton.Yes:
                 self._export_thread.abort()
-                self._export_thread.wait(3000)
+                self._export_thread.wait(4000)
             else:
                 event.ignore()
                 return
+        for t in (self._loader_thread, self._preview_thread):
+            if t and t.isRunning():
+                if hasattr(t, 'abort'):
+                    t.abort()
+                t.wait(2000)
         event.accept()
 
 
@@ -1379,10 +1476,11 @@ class FilterToolkitWindow(QMainWindow):
 # ---------------------------------------------------------------------------
 
 class CameraPickerDialog(QDialog):
+
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("R_Tools  •  Image Filter Toolkit")
-        self.setFixedSize(440, 180)
+        self.setWindowTitle("R_Tools  Image Filter Toolkit  v2.0")
+        self.setFixedSize(480, 200)
         self.setStyleSheet(DARK_STYLE)
         self._selected_cam_id   = None
         self._selected_cam_name = None
@@ -1407,11 +1505,9 @@ class CameraPickerDialog(QDialog):
         btn_row.setSpacing(8)
         cancel_btn = QPushButton("Cancel")
         cancel_btn.clicked.connect(self.reject)
-
-        self._select_btn = QPushButton("Open Filter Toolkit  →")
+        self._select_btn = QPushButton("Open Filter Toolkit  ->")
         self._select_btn.setObjectName("export_btn")
         self._select_btn.clicked.connect(self._on_select)
-
         btn_row.addStretch(1)
         btn_row.addWidget(cancel_btn)
         btn_row.addWidget(self._select_btn)
@@ -1427,8 +1523,7 @@ class CameraPickerDialog(QDialog):
     def _populate_cameras(self):
         self._cameras = get_all_cameras()
         if not self._cameras:
-            self._info_lbl.setText(
-                "⚠  No cameras found in the current 3DE project.")
+            self._info_lbl.setText("No cameras found in the current project.")
             self._select_btn.setEnabled(False)
             return
         for cam_id, cam_name in self._cameras:
@@ -1437,13 +1532,12 @@ class CameraPickerDialog(QDialog):
 
     def _on_cam_selected(self, idx: int):
         if 0 <= idx < len(self._cameras):
-            cam_id, cam_name = self._cameras[idx]
+            cam_id, _ = self._cameras[idx]
             info = get_camera_sequence_info(cam_id)
             path = info["display_path"] or "(no footage path detected)"
             n    = info["n_frames"]
             frames_str = (
-                f"Frames: {info['first_frame']} – {info['last_frame']}  "
-                f"({n} frames)"
+                f"Frames: {info['first_frame']} - {info['last_frame']}  ({n} frames)"
                 if n > 0 else "No frames registered (getCameraNoFrames = 0)"
             )
             self._info_lbl.setText(f"{path}\n{frames_str}")
@@ -1459,61 +1553,52 @@ class CameraPickerDialog(QDialog):
 
 
 # ---------------------------------------------------------------------------
-# Entry point  (called by 3DE when menu item is triggered)
+# Entry point
 # ---------------------------------------------------------------------------
 
 def main():
-    # Re-use the existing Qt application (3DE is a Qt app)
-    app = QApplication.instance()
-    if app is None:
-        app = QApplication(sys.argv)
+    app = QApplication.instance() or QApplication(sys.argv)
 
-    # ----- Check dependencies -----------------------------------------------
-    if not (HAS_OIIO or HAS_CV2):
+    # fix #7: OIIO Python binding is required (system binary alone is not enough)
+    if not HAS_OIIO:
         QMessageBox.critical(
             None,
-            "Missing Dependencies",
-            "R_Tools Image Filter Toolkit requires at least one image backend:\n\n"
-            "  • OpenImageIO  (pip install openimageio)   ← recommended\n"
-            "  • OpenCV        (pip install opencv-python)\n\n"
-            "Please install one and restart 3DEqualizer."
+            "OpenImageIO Python Binding Required",
+            "R_Tools Image Filter Toolkit requires the OpenImageIO Python binding.\n\n"
+            "Install it with:\n"
+            "    pip install openimageio\n\n"
+            "Note: having the system OIIO binary on PATH is NOT sufficient.\n"
+            "The Python package must be installed into 3DE's Python environment."
         )
         return
 
-    if not HAS_SCIPY:
-        reply = QMessageBox.question(
+    if not HAS_CV2:
+        QMessageBox.information(
             None,
-            "scipy Not Found",
-            "scipy is not installed. The Gaussian blur will fall back to a slower\n"
-            "pure-numpy implementation which may affect performance.\n\n"
-            "Continue anyway?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            "OpenCV Not Found  (optional)",
+            "OpenCV is not installed.\n\n"
+            "The Denoise filter will be unavailable.\n"
+            "All other filters (Sharpen, High-Pass, Contrast) work normally.\n\n"
+            "To enable denoising:\n"
+            "    pip install opencv-python"
         )
-        if reply != QMessageBox.StandardButton.Yes:
-            return
 
-    # ----- Camera picker dialog ----------------------------------------------
     picker = CameraPickerDialog()
     if picker.exec() != QDialog.DialogCode.Accepted:
         return
-
     cam_id, cam_name = picker.selected_camera()
     if not cam_id:
         return
 
-    # ----- Main window -------------------------------------------------------
     win = FilterToolkitWindow(cam_id, cam_name)
     win.show()
     win.raise_()
     win.activateWindow()
 
-    # Keep a reference so it isn't garbage-collected
     if not hasattr(main, "_windows"):
         main._windows = []
     main._windows.append(win)
 
-    # If 3DE manages its own event loop, we don't call app.exec()
-    # If running standalone (testing), we do.
     if not QApplication.instance().property("tde4_managed"):
         try:
             app.exec()
@@ -1521,5 +1606,4 @@ def main():
             pass
 
 
-# 3DE calls the script body directly; call main() here.
 main()
