@@ -22,7 +22,7 @@ if not exist "libs" mkdir "libs"
 
 echo [3/3] Installing dependencies into libs...
 uv pip install --target .\libs --upgrade ^
-  numpy scipy matplotlib openimageio opencv-python pyside6
+    numpy scipy matplotlib openimageio opencv-python pyside6 pillow
 if errorlevel 1 (
     echo Dependency installation failed.
     exit /b 1
