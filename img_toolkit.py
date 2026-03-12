@@ -13,6 +13,19 @@ import traceback
 import concurrent.futures
 from pathlib import Path
 
+
+def _prepend_local_libs_path() -> None:
+    """Prefer workspace-local bundled dependencies when available."""
+    script_dir = Path(__file__).resolve().parent
+    libs_dir = script_dir / "libs"
+    if libs_dir.is_dir():
+        libs_str = str(libs_dir)
+        if libs_str not in sys.path:
+            sys.path.insert(0, libs_str)
+
+
+_prepend_local_libs_path()
+
 import numpy as np
 
 import tde4  # 3DEqualizer Python API
@@ -1606,4 +1619,5 @@ def main():
             pass
 
 
-main()
+if __name__ == "__main__":
+    main()
