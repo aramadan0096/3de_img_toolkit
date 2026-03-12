@@ -5,7 +5,7 @@ Image Toolkit is a 3DEqualizer helper that lets you preview and export filtered 
 It is designed for practical shot work: pick a camera, adjust filters visually, compare original vs filtered result, then export and relink the footage path back in 3DE.
 
 ![Screenshot of project](./assets/main_ui.png)
-
+<!-- 
 ## What Is In This Codebase
 
 - `img_toolkit.py`: Main GUI tool used inside 3DEqualizer.
@@ -13,7 +13,7 @@ It is designed for practical shot work: pick a camera, adjust filters visually, 
 - `imgToolkit.py`: Small 3DE menu entry script that calls the proxy bootstrap.
 - `install_3de_proxy_patch.ps1`: Installer that writes plugin scripts into your 3DE plugin folder and patches a static toolkit path.
 - `install_uv_and_libs.bat`: One-click dependency installer into the local `libs` folder.
-- `libs/`: Local Python dependencies used by the toolkit.
+- `libs/`: Local Python dependencies used by the toolkit. -->
 
 ## Main Features
 
@@ -31,6 +31,8 @@ It is designed for practical shot work: pick a camera, adjust filters visually, 
 - Sequence export with progress feedback.
 - Automatic update of 3DE camera sequence path after export.
 
+![filters](./assets/menu.png)
+
 ## How It Works (High Level)
 
 1. Open the tool from 3DE.
@@ -38,6 +40,8 @@ It is designed for practical shot work: pick a camera, adjust filters visually, 
 3. Move through frames and tune filters until the look is right.
 4. Export the filtered sequence to an output folder.
 5. The tool updates the camera footage pattern in 3DE to point to the new files.
+
+![cameras](./assets/camera_selection.png)
 
 ## Installation Guide
 
