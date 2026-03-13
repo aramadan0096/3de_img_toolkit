@@ -44,7 +44,7 @@ It is designed for practical shot work: pick a camera, adjust filters visually, 
 4. Export the filtered sequence to an output folder.
 5. The tool updates the camera footage pattern in 3DE to point to the new files.
 
-![cameras](./assets/camera_selection.png =x0.5)
+![cameras](./assets/camera_selection.png)
 
 
 ## Installation Guide
