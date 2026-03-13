@@ -7,10 +7,13 @@ from pathlib import Path
 from . import deps
 
 HAS_OIIO = deps.HAS_OIIO
+HAS_OPENEXR = getattr(deps, "HAS_OPENEXR", False)
 HAS_PIL = deps.HAS_PIL
 np = deps.np
 oiio = deps.oiio
 Image = deps.Image
+OpenEXR = getattr(deps, "OpenEXR", None)
+Imath = getattr(deps, "Imath", None)
 
 SUPPORTED_READ_EXTS = {".exr", ".jpg", ".jpeg", ".png"}
 SUPPORTED_EXPORT_EXTS = {".exr", ".jpg", ".jpeg", ".png"}
@@ -64,30 +67,114 @@ def normalize_export_ext(ext: str) -> str:
 
 class ImageIO:
     @staticmethod
-    def _load_exr(path: str) -> tuple[np.ndarray, dict]:
-        if not HAS_OIIO:
-            raise RuntimeError(
-                "OpenImageIO Python binding is required to read EXR files.\n"
-                "Install: pip install openimageio"
-            )
-        inp = oiio.ImageInput.open(path)
-        if inp is None:
-            raise IOError("OIIO cannot open '%s': %s" % (path, oiio.geterror()))
-        spec = inp.spec()
-        pixels = inp.read_image(oiio.FLOAT)
-        inp.close()
-        if pixels is None:
-            raise IOError("OIIO read_image failed for '%s'" % path)
-        if pixels.ndim == 2:
-            pixels = pixels[:, :, np.newaxis]
-        meta = {
-            "width": spec.width,
-            "height": spec.height,
-            "nchannels": spec.nchannels,
-            "channelnames": list(spec.channelnames),
+    def _load_exr_openexr(path: str) -> tuple[np.ndarray, dict]:
+        exr = OpenEXR.InputFile(path)
+        header = exr.header()
+        data_window = header["dataWindow"]
+        width = data_window.max.x - data_window.min.x + 1
+        height = data_window.max.y - data_window.min.y + 1
+
+        header_channels = list(header.get("channels", {}).keys())
+        preferred = [c for c in ("R", "G", "B", "A") if c in header_channels]
+        channel_names = preferred if preferred else header_channels[:4]
+        if not channel_names:
+            raise RuntimeError("EXR file has no channels: %s" % path)
+
+        pt_float = Imath.PixelType(Imath.PixelType.FLOAT)
+        arrays = []
+        for chan in channel_names:
+            raw = exr.channel(chan, pt_float)
+            arr = np.frombuffer(raw, dtype=np.float32)
+            arr = arr.reshape((height, width))
+            arrays.append(arr)
+
+        pixels = np.stack(arrays, axis=2).astype(np.float32)
+        return pixels, {
+            "width": width,
+            "height": height,
+            "nchannels": pixels.shape[2],
+            "channelnames": channel_names,
             "ext": ".exr",
         }
-        return pixels.astype(np.float32), meta
+
+    @staticmethod
+    def _load_exr(path: str) -> tuple[np.ndarray, dict]:
+        if HAS_OIIO:
+            inp = oiio.ImageInput.open(path)
+            if inp is None:
+                raise IOError("OIIO cannot open '%s': %s" % (path, oiio.geterror()))
+            spec = inp.spec()
+            pixels = inp.read_image(oiio.FLOAT)
+            inp.close()
+            if pixels is None:
+                raise IOError("OIIO read_image failed for '%s'" % path)
+            if pixels.ndim == 2:
+                pixels = pixels[:, :, np.newaxis]
+            meta = {
+                "width": spec.width,
+                "height": spec.height,
+                "nchannels": spec.nchannels,
+                "channelnames": list(spec.channelnames),
+                "ext": ".exr",
+            }
+            return pixels.astype(np.float32), meta
+
+        if HAS_OPENEXR:
+            return ImageIO._load_exr_openexr(path)
+
+        raise RuntimeError(
+            "EXR support requires OpenImageIO or OpenEXR.\n"
+            "Install deps with: .\\install_uv_and_libs.bat"
+        )
+
+    @staticmethod
+    def _save_exr_openexr(path: str, pixels: np.ndarray, metadata: dict | None = None) -> None:
+        h, w = pixels.shape[:2]
+        nc = pixels.shape[2] if pixels.ndim == 3 else 1
+
+        if metadata and "channelnames" in metadata and metadata["channelnames"]:
+            ch_names = list(metadata["channelnames"])[:nc]
+        else:
+            defaults = ["R", "G", "B", "A"]
+            ch_names = defaults[:nc] if nc <= 4 else ["C%d" % i for i in range(nc)]
+
+        header = OpenEXR.Header(w, h)
+        pt_float = Imath.PixelType(Imath.PixelType.FLOAT)
+        header["channels"] = {name: Imath.Channel(pt_float) for name in ch_names}
+
+        out = OpenEXR.OutputFile(path, header)
+        payload = {}
+        for idx, name in enumerate(ch_names):
+            chan = np.ascontiguousarray(pixels[:, :, idx].astype(np.float32))
+            payload[name] = chan.tobytes()
+        out.writePixels(payload)
+        out.close()
+
+    @staticmethod
+    def _save_exr(path: str, pixels: np.ndarray, metadata: dict | None = None) -> None:
+        if HAS_OIIO:
+            h, w = pixels.shape[:2]
+            nc = pixels.shape[2] if pixels.ndim == 3 else 1
+            spec = oiio.ImageSpec(w, h, nc, oiio.FLOAT)
+            spec.attribute("compression", "zips")
+            if metadata and "channelnames" in metadata:
+                spec.channelnames = metadata["channelnames"]
+            out = oiio.ImageOutput.create(path)
+            if out is None:
+                raise IOError("OIIO cannot create '%s': %s" % (path, oiio.geterror()))
+            out.open(path, spec)
+            out.write_image(pixels.astype(np.float32))
+            out.close()
+            return
+
+        if HAS_OPENEXR:
+            ImageIO._save_exr_openexr(path, pixels, metadata)
+            return
+
+        raise RuntimeError(
+            "EXR support requires OpenImageIO or OpenEXR.\n"
+            "Install deps with: .\\install_uv_and_libs.bat"
+        )
 
     @staticmethod
     def _load_ldr(path: str) -> tuple[np.ndarray, dict]:
@@ -126,26 +213,6 @@ class ImageIO:
         if ext == ".exr":
             return ImageIO._load_exr(path)
         return ImageIO._load_ldr(path)
-
-    @staticmethod
-    def _save_exr(path: str, pixels: np.ndarray, metadata: dict | None = None) -> None:
-        if not HAS_OIIO:
-            raise RuntimeError(
-                "OpenImageIO Python binding is required to export EXR files.\n"
-                "Install: pip install openimageio"
-            )
-        h, w = pixels.shape[:2]
-        nc = pixels.shape[2] if pixels.ndim == 3 else 1
-        spec = oiio.ImageSpec(w, h, nc, oiio.FLOAT)
-        spec.attribute("compression", "zips")
-        if metadata and "channelnames" in metadata:
-            spec.channelnames = metadata["channelnames"]
-        out = oiio.ImageOutput.create(path)
-        if out is None:
-            raise IOError("OIIO cannot create '%s': %s" % (path, oiio.geterror()))
-        out.open(path, spec)
-        out.write_image(pixels.astype(np.float32))
-        out.close()
 
     @staticmethod
     def _save_ldr(path: str, pixels: np.ndarray) -> None:

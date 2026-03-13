@@ -31,7 +31,10 @@ It is designed for practical shot work: pick a camera, adjust filters visually, 
 - Sequence export with progress feedback.
 - Automatic update of 3DE camera sequence path after export.
 
-![filters](./assets/menu.png)
+<!-- ![filters](./assets/menu.png) -->
+<img src="./assets/menu.png" alt="filters" width="200">
+
+
 
 ## How It Works (High Level)
 
@@ -41,7 +44,8 @@ It is designed for practical shot work: pick a camera, adjust filters visually, 
 4. Export the filtered sequence to an output folder.
 5. The tool updates the camera footage pattern in 3DE to point to the new files.
 
-![cameras](./assets/camera_selection.png)
+![cameras](./assets/camera_selection.png =x0.5)
+
 
 ## Installation Guide
 
@@ -52,6 +56,16 @@ It is designed for practical shot work: pick a camera, adjust filters visually, 
 
 ```powershell
 .\install_uv_and_libs.bat
+```
+
+   - The installer now prompts for the Python version (default: `3.11`).
+   - Dependencies are installed into versioned folders under `libs`, for example:
+     - `libs\py311`
+     - `libs\py37`
+   - You can also pass arguments directly:
+
+```powershell
+.\install_uv_and_libs.bat 3.7 "C:\path\to\python.exe"
 ```
 
 3. Install 3DE plugin scripts:
@@ -73,9 +87,10 @@ It is designed for practical shot work: pick a camera, adjust filters visually, 
 
 ## Notes
 
-- The tool expects dependencies to be available in `libs`.
+- The tool expects dependencies to be available in `libs\pyXX` (for the active Python version).
 - If your plugin path is under Program Files, run PowerShell as Administrator during install.
 - If needed, you can override the toolkit path with the environment variable `IMG_TOOLKIT_ROOT`.
+- On Python 3.7, if `openimageio` is unavailable, the installer automatically tries an `OpenEXR` fallback.
 
 ## Typical Usage Tips
 
@@ -93,4 +108,5 @@ It is designed for practical shot work: pick a camera, adjust filters visually, 
 - Denoise unavailable:
   - Re-run dependency installer to ensure OpenCV is present in `libs`.
 - EXR load/save issues:
-  - Re-run dependency installer to ensure OpenImageIO is present in `libs`.
+  - Re-run dependency installer for your target Python version.
+  - For Python 3.7, EXR support may come from `OpenEXR` fallback when `OpenImageIO` wheels are not available.

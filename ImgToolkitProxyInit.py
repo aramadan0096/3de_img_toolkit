@@ -22,6 +22,25 @@ IMG_TOOLKIT_ENTRY = "img_toolkit.py"
 _RUNTIME_MODULE_NAME = "img_toolkit_runtime_proxy"
 
 
+def _iter_local_lib_dirs(toolkit_root):
+    """Yield interpreter-matching local dependency dirs in priority order."""
+    py_tag = "py%d%d" % (sys.version_info[0], sys.version_info[1])
+    versioned_libs = os.path.join(toolkit_root, "libs", py_tag)
+    if os.path.isdir(versioned_libs):
+        yield versioned_libs
+
+    # Backward compatibility with previous flat naming.
+    legacy_versioned_libs = os.path.join(toolkit_root, "libs_%s" % py_tag)
+    if os.path.isdir(legacy_versioned_libs):
+        yield legacy_versioned_libs
+
+    # Backward compatibility for the existing default folder.
+    if sys.version_info[:2] == (3, 11):
+        default_libs = os.path.join(toolkit_root, "libs")
+        if os.path.isdir(default_libs):
+            yield default_libs
+
+
 def _notify_error(message):
     if tde4 is not None:
         try:
@@ -46,7 +65,13 @@ def _resolve_root():
 def _load_runtime_module(module_path):
     module = sys.modules.get(_RUNTIME_MODULE_NAME)
     if module is not None:
-        return module
+        cached_file = getattr(module, "__file__", None)
+        same_file = cached_file and os.path.abspath(cached_file) == os.path.abspath(module_path)
+        if same_file and callable(getattr(module, "main", None)):
+            return module
+
+        # Drop stale/partial module objects and reload from disk.
+        sys.modules.pop(_RUNTIME_MODULE_NAME, None)
 
     spec = importlib.util.spec_from_file_location(_RUNTIME_MODULE_NAME, module_path)
     if spec is None or spec.loader is None:
@@ -54,14 +79,18 @@ def _load_runtime_module(module_path):
 
     module = importlib.util.module_from_spec(spec)
     sys.modules[_RUNTIME_MODULE_NAME] = module
-    spec.loader.exec_module(module)
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        # Avoid returning a half-initialized cached module on the next launch.
+        sys.modules.pop(_RUNTIME_MODULE_NAME, None)
+        raise
     return module
 
 
 def run():
     toolkit_root = _resolve_root()
     module_path = os.path.join(toolkit_root, IMG_TOOLKIT_ENTRY)
-    libs_path = os.path.join(toolkit_root, "libs")
 
     if not os.path.isfile(module_path):
         raise RuntimeError(
@@ -70,8 +99,9 @@ def run():
             "Expected file: %s" % (toolkit_root, module_path)
         )
 
-    if os.path.isdir(libs_path) and libs_path not in sys.path:
-        sys.path.insert(0, libs_path)
+    for lib_dir in _iter_local_lib_dirs(toolkit_root):
+        if lib_dir not in sys.path:
+            sys.path.insert(0, lib_dir)
     if toolkit_root not in sys.path:
         sys.path.insert(0, toolkit_root)
 
