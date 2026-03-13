@@ -60,6 +60,20 @@ It is designed for practical shot work: pick a camera, adjust filters visually, 
 
    - The installer now prompts for the Python version (default: `3.11`).
    - The installer recreates `.venv` using the selected Python version before installing packages.
+
+  |                   3DEqualizer release | Bundled / runtime Python version                                                            | Source                 |
+| ------------------------------------: | :------------------------------------------------------------------------------------------ | :--------------------- |
+|                 Release 6 (R6) — 2020 | **Python 2.7** (2.7.x — micro version not specified in release notes).                      | ([3dequalizer.com][1]) |
+| Release 7 (R7.0 / R7.1) — 2021 / 2022 | **Python 3.7** (3DE4 R7 ships with its own Python 3.7 runtime; scripts were ported to Py3). | ([3dequalizer.com][2]) |
+|               Release 8 (R8.0) — 2024 | **Python 3.9.18** (R8.0 beta notes mention 3.9.18 specifically).                            | ([3dequalizer.com][3]) |
+|    Release 8.1 (R8.1) — 2025 (latest) | **Python 3.11** (runtime updated to Python 3.11 in R8.1 notes; exact patch unspecified).    | ([3dequalizer.com][4]) |
+
+[1]: https://www.3dequalizer.com/?id=200424_01&site=devblog&utm_source=chatgpt.com "3DEqualizer4 - DevBlog - 3DE4 Release 6"
+[2]: https://3dequalizer.com/?id=210516_01&site=devblog&utm_source=chatgpt.com "DevBlog - 3DEqualizer4 R7.0 now available"
+[3]: https://www.3dequalizer.com/?id=240605_01&site=devblog&utm_source=chatgpt.com "3DEqualizer4 - DevBlog - 3DE4 R8.0 beta11"
+[4]: https://www.3dequalizer.com/?id=251111_01&site=devblog&utm_source=chatgpt.com "DevBlog - 3DEqualizer4 R8.1"
+
+
    - Dependencies are installed into versioned folders under `libs`, for example:
      - `libs\py311`
      - `libs\py37`
