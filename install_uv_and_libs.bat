@@ -22,7 +22,15 @@ if not "%PY_EXE%"=="" set "PYTHON_SELECTOR=%PY_EXE%"
 set "TARGET_DIR=libs\%PY_TAG%"
 echo Selected Python version: %PY_SPEC_NORM% ^(%PY_TAG%^)
 
-echo [1/3] Checking uv...
+if "%PY_SPEC_NORM%"=="3.7" if "%PY_EXE%"=="" (
+    call :FindPy37Interpreter
+    if not "!PY37_FOUND!"=="" (
+        set "PYTHON_SELECTOR=!PY37_FOUND!"
+        echo Auto-detected Python 3.7 interpreter: !PYTHON_SELECTOR!
+    )
+)
+
+echo [1/4] Checking uv...
 where uv >nul 2>nul
 if errorlevel 1 (
     echo uv is not installed. Installing with PowerShell...
@@ -36,11 +44,35 @@ if errorlevel 1 (
     if exist "%UV_BIN%\uv.exe" set "PATH=%UV_BIN%;%PATH%"
 )
 
-echo [2/3] Preparing %TARGET_DIR% folder for Python %PY_SPEC_NORM%...
+echo [2/4] Rebuilding .venv for Python %PY_SPEC_NORM%...
+if exist ".venv" (
+    rmdir /s /q ".venv"
+    if exist ".venv" (
+        echo Failed to remove existing .venv.
+        echo Close shells/tools using .venv and run again.
+        exit /b 1
+    )
+)
+
+uv venv --python "%PYTHON_SELECTOR%" .venv
+if errorlevel 1 (
+    echo Failed to create .venv with Python %PY_SPEC_NORM%.
+    if "%PY_SPEC_NORM%"=="3.7" if "%PY_EXE%"=="" (
+        echo Python 3.7 was not auto-detected.
+        echo Pass explicit interpreter path, for example:
+        echo   install_uv_and_libs.bat 3.7 "C:\Users\%USERNAME%\Downloads\3DEqualizer4\sys_data\py37_inst\python.exe"
+    )
+    if not "%PY_EXE%"=="" echo Python executable was: %PY_EXE%
+    exit /b 1
+)
+
+set "PYTHON_SELECTOR=.venv\Scripts\python.exe"
+
+echo [3/4] Preparing %TARGET_DIR% folder for Python %PY_SPEC_NORM%...
 if not exist "libs" mkdir "libs"
 if not exist "%TARGET_DIR%" mkdir "%TARGET_DIR%"
 
-echo [3/3] Installing dependencies into %TARGET_DIR%...
+echo [4/4] Installing dependencies into %TARGET_DIR%...
 if "%PY_SPEC_NORM%"=="3.7" (
     uv pip install --python "%PYTHON_SELECTOR%" --target .\%TARGET_DIR% --upgrade ^
         "numpy<1.22" "scipy<1.8" "matplotlib<3.6" "opencv-python<4.8" "pillow<10" "pyside6<6.5"
@@ -131,5 +163,46 @@ if "%MINOR%"=="" (
 )
 
 set "PY_SPEC_NORM=%MAJOR%.%MINOR%"
+
+if "%MAJOR%" NEQ "3" (
+    echo Unsupported Python major version: %MAJOR%
+    echo Use Python 3.x values like 3.7 or 3.11.
+    exit /b 1
+)
+
+if "%MINOR%"=="" (
+    echo Invalid Python version format: %RAW%
+    echo Use values like 3.7, 3.11, 37, or 311.
+    exit /b 1
+)
+
+if not "%MINOR%"=="7" if not "%MINOR%"=="8" if not "%MINOR%"=="9" if not "%MINOR%"=="10" if not "%MINOR%"=="11" if not "%MINOR%"=="12" if not "%MINOR%"=="13" (
+    echo Unsupported Python minor version: %MINOR%
+    echo Use supported versions: 3.7, 3.8, 3.9, 3.10, 3.11, 3.12, 3.13.
+    exit /b 1
+)
+
 set "PY_TAG=py%MAJOR%%MINOR%"
+exit /b 0
+
+:FindPy37Interpreter
+set "PY37_FOUND="
+
+if exist "%USERPROFILE%\Downloads\3DEqualizer4\sys_data\py37_inst\python.exe" (
+    set "PY37_FOUND=%USERPROFILE%\Downloads\3DEqualizer4\sys_data\py37_inst\python.exe"
+    exit /b 0
+)
+
+for /f "delims=" %%P in ('where py 2^>nul') do (
+    set "PY_LAUNCHER=%%P"
+    goto :TryPyLauncher37
+)
+goto :EndFindPy37
+
+:TryPyLauncher37
+for /f "delims=" %%E in ('"%PY_LAUNCHER%" -3.7 -c "import sys; print(sys.executable)" 2^>nul') do (
+    if exist "%%E" set "PY37_FOUND=%%E"
+)
+
+:EndFindPy37
 exit /b 0

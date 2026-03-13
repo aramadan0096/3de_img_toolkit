@@ -44,7 +44,7 @@ It is designed for practical shot work: pick a camera, adjust filters visually, 
 4. Export the filtered sequence to an output folder.
 5. The tool updates the camera footage pattern in 3DE to point to the new files.
 
-![cameras](./assets/camera_selection.png =x0.5)
+![cameras](./assets/camera_selection.png)
 
 
 ## Installation Guide
@@ -59,6 +59,7 @@ It is designed for practical shot work: pick a camera, adjust filters visually, 
 ```
 
    - The installer now prompts for the Python version (default: `3.11`).
+   - The installer recreates `.venv` using the selected Python version before installing packages.
    - Dependencies are installed into versioned folders under `libs`, for example:
      - `libs\py311`
      - `libs\py37`
