@@ -89,6 +89,9 @@ It is designed for practical shot work: pick a camera, adjust filters visually, 
 .\install_3de_proxy_patch.ps1
 ```
 
+> [!CAUTION]
+> You may face some issues due to ExcutionPolicy, please check [Microsoft](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.security/set-executionpolicy?view=powershell-7.5) official documentation. Also ensure running it as administrator for write permission in 3de installation directory. 
+
 4. When asked, enter your 3DE plugin scripts folder.
 5. Restart 3DEqualizer (if already open).
 6. Run the script named `Image Toolkit` from 3DE script menus.
